@@ -79,9 +79,12 @@ struct InstallArgs {
     /// Stage the verified installer and reboot through the selected handoff.
     #[arg(long)]
     execute: bool,
-    /// Permit a missing or invalid signature for this caller-selected local bundle.
+    /// Detached Ed25519 signature for the local installer bundle.
     #[arg(long)]
-    allow_unsigned_bundle: bool,
+    bundle_signature: Option<PathBuf>,
+    /// Expected SHA-256 checksum for the local installer bundle.
+    #[arg(long)]
+    bundle_sha256: Option<String>,
 }
 #[derive(Subcommand)]
 enum RootfsCommand {
@@ -135,6 +138,12 @@ enum BundleCommand {
         version: String,
         #[arg(long)]
         base_url: Url,
+        /// URL of a detached Ed25519 signature for the installer bundle.
+        #[arg(long)]
+        signature_url: Option<Url>,
+        /// Expected SHA-256 checksum for the installer bundle.
+        #[arg(long)]
+        sha256: Option<String>,
         #[arg(
             long,
             env = "ENCVOL_BUNDLE_DIR",
@@ -151,9 +160,12 @@ enum BundleCommand {
             default_value = "/var/lib/encvol/releases"
         )]
         directory: PathBuf,
-        /// Permit a missing or invalid signature for this caller-selected local bundle.
+        /// Detached Ed25519 signature for the installer bundle.
         #[arg(long)]
-        allow_unsigned_bundle: bool,
+        signature: Option<PathBuf>,
+        /// Expected SHA-256 checksum for the installer bundle.
+        #[arg(long)]
+        sha256: Option<String>,
     },
 }
 
@@ -175,42 +187,54 @@ fn main() -> Result<()> {
                 BundleCommand::Verify {
                     version,
                     directory,
-                    allow_unsigned_bundle,
+                    signature,
+                    sha256,
                 },
         } => {
             if !bundle::valid_version(&version) {
                 bail!("invalid bundle version")
             };
-            let policy = if allow_unsigned_bundle {
-                bundle::SignaturePolicy::AllowUnsignedLocal
-            } else {
-                bundle::SignaturePolicy::Strict
-            };
-            if allow_unsigned_bundle {
-                eprintln!("WARNING: installer signature verification disabled");
-            }
-            let (digest, _) = bundle::verify_bundle_with_policy(
+            let policy = bundle_policy(signature.as_deref(), sha256.as_deref());
+            warn_bundle_verification(bundle_policy_from_presence(
+                signature.is_some(),
+                sha256.is_some(),
+            ));
+            let result = bundle::verify_bundle_with_policy(
                 &bundle::bundle_path(&directory, &version),
-                &bundle::signature_path(&directory, &version),
                 policy,
             )
             .map_err(anyhow::Error::msg)?;
-            println!("verified installer {version}: sha256:{digest}");
+            println!(
+                "verified installer {version}: sha256:{} ({})",
+                result.sha256,
+                result.verification.as_str()
+            );
         }
         Top::Bundle {
             command:
                 BundleCommand::Fetch {
                     version,
                     base_url,
+                    signature_url,
+                    sha256,
                     directory,
                 },
         } => {
-            let (bundle_path, signature_path) =
-                bundle::fetch_bundle(&base_url, &version, &directory)
-                    .map_err(anyhow::Error::msg)?;
-            let digest =
-                bundle::verify_bundle(&bundle_path, &signature_path).map_err(anyhow::Error::msg)?;
-            println!("fetched and verified installer {version}: sha256:{digest}");
+            let policy = bundle_policy_from_presence(signature_url.is_some(), sha256.is_some());
+            warn_bundle_verification(policy);
+            let (_, _, result) = bundle::fetch_bundle(
+                &base_url,
+                &version,
+                &directory,
+                signature_url.as_ref(),
+                sha256.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            println!(
+                "fetched installer {version}: sha256:{} ({})",
+                result.sha256,
+                result.verification.as_str()
+            );
         }
         Top::Install(args) => install(args)?,
         Top::Rootfs { command } => rootfs_command(command)?,
@@ -252,20 +276,17 @@ fn install(args: InstallArgs) -> Result<()> {
         }),
     };
     manifest.validate().map_err(anyhow::Error::msg)?;
-    let requested_verification = if args.allow_unsigned_bundle {
-        bundle::SignatureVerification::Disabled
-    } else {
-        bundle::SignatureVerification::Verified
-    };
-    let plan = installer::build_plan_with_signature_verification(
+    let requested_verification = bundle_policy_from_presence(
+        args.bundle_signature.is_some(),
+        args.bundle_sha256.is_some(),
+    );
+    let plan = installer::build_plan_with_bundle_verification(
         &manifest,
         report.handoff,
         requested_verification,
     )
     .map_err(anyhow::Error::msg)?;
-    if args.allow_unsigned_bundle {
-        eprintln!("WARNING: installer signature verification disabled");
-    }
+    warn_bundle_verification(requested_verification);
     if !args.execute {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
@@ -277,14 +298,12 @@ fn install(args: InstallArgs) -> Result<()> {
         .bundle_directory
         .join("staged")
         .join(&args.bundle_version);
-    let policy = if args.allow_unsigned_bundle {
-        bundle::SignaturePolicy::AllowUnsignedLocal
-    } else {
-        bundle::SignaturePolicy::Strict
-    };
+    let policy = bundle_policy(
+        args.bundle_signature.as_deref(),
+        args.bundle_sha256.as_deref(),
+    );
     let mut installer_bundle = bundle::stage_bundle_with_policy(
         &bundle::bundle_path(&args.bundle_directory, &args.bundle_version),
-        &bundle::signature_path(&args.bundle_directory, &args.bundle_version),
         &stage,
         policy,
     )
@@ -301,6 +320,37 @@ fn install(args: InstallArgs) -> Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
     Ok(())
+}
+
+fn bundle_policy<'a>(
+    signature: Option<&'a std::path::Path>,
+    checksum: Option<&'a str>,
+) -> bundle::VerificationPolicy<'a> {
+    bundle::VerificationPolicy {
+        signature,
+        checksum,
+    }
+}
+
+fn bundle_policy_from_presence(signature: bool, checksum: bool) -> bundle::BundleVerification {
+    match (signature, checksum) {
+        (true, true) => bundle::BundleVerification::SignatureAndChecksum,
+        (true, false) => bundle::BundleVerification::Signature,
+        (false, true) => bundle::BundleVerification::Checksum,
+        (false, false) => bundle::BundleVerification::None,
+    }
+}
+
+fn warn_bundle_verification(verification: bundle::BundleVerification) {
+    match verification {
+        bundle::BundleVerification::Signature | bundle::BundleVerification::SignatureAndChecksum => {}
+        bundle::BundleVerification::Checksum => eprintln!(
+            "WARNING: installer bundle is verified only by SHA-256 checksum; checksum does not prove publisher authenticity"
+        ),
+        bundle::BundleVerification::None => eprintln!(
+            "WARNING: installer bundle has no signature or checksum verification; only bundle structure will be checked"
+        ),
+    }
 }
 
 fn rootfs_command(command: RootfsCommand) -> Result<()> {

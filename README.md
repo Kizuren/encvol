@@ -123,8 +123,14 @@ Verify a published local release before staging it:
 
 ```sh
 target/release/encvol bundle verify --version VERSION \
-  --directory /var/lib/encvol/releases
+  --directory /var/lib/encvol/releases \
+  --signature /var/lib/encvol/releases/encvol-installer-VERSION.bundle.sig
 ```
+
+If you only have an independently published checksum, pass
+`--sha256 HEX_DIGEST` or `--sha256 sha256:HEX_DIGEST`. Checksum-only mode
+protects against accidental corruption but does not prove publisher
+authenticity.
 
 Generate a replacement release key on the release host only. The private key
 is encrypted, root-owned, mode `0600`, and is never copied into this
@@ -147,7 +153,8 @@ sudo openssl pkeyutl -sign \
   -inkey /var/lib/encvol-release/signing-key.pem -rawin \
   -in encvol-installer-VERSION.bundle | base64 -w 0 \
   > encvol-installer-VERSION.bundle.sig
-target/release/encvol bundle verify --version VERSION --directory .
+target/release/encvol bundle verify --version VERSION --directory . \
+  --signature encvol-installer-VERSION.bundle.sig
 ```
 
 The detached signature is standard base64 text over the exact, unmodified
@@ -162,11 +169,14 @@ they can verify bundles signed by it. Never put a passphrase, private key,
 derived key, or recovery secret in shell history, repository files, test
 artifacts, or logs.
 
-For a caller-selected local test bundle only, `install` and `bundle verify`
-accept `--allow-unsigned-bundle`. It prints `WARNING: installer signature
-verification disabled` and the plan records `"signature_verification":
-"disabled"`; tar and boot-component validation remains enforced. `bundle
-fetch` never accepts this bypass and always requires a valid signature.
+Installer bundle signatures are optional but recommended. `install`, `bundle
+verify`, and `bundle fetch` warn when no signature is supplied. A signature is
+provided explicitly with `--bundle-signature` for `install`, `--signature` for
+`bundle verify`, or `--signature-url` for `bundle fetch`. Checksum verification
+is available with `--bundle-sha256` or `--sha256`; checksum-only mode also
+warns because it is an integrity check, not an authenticity check. Tar and
+boot-component validation is always enforced, even without signature or
+checksum material.
 
 ## Local QEMU runbook
 
@@ -178,7 +188,10 @@ while a case runs. SeaBIOS covers BIOS and OVMF covers UEFI.
 
 ## Execute an installation
 
-`--execute` is the final, disk-changing step. It stages the verified installer bundle and reboots once into RAM; the RAM installer repeats the safety and rootfs checksum checks before wiping the disk.
+`--execute` is the final, disk-changing step. It stages the installer bundle
+and reboots once into RAM; the RAM installer repeats the safety and rootfs
+checksum checks before wiping the disk. Pass `--bundle-signature` to
+authenticate the bundle before staging it.
 
 ```sh
 sudo target/release/encvol install \
@@ -188,6 +201,7 @@ sudo target/release/encvol install \
   --tang-thumbprint 'PINNED_TANG_THUMBPRINT' \
   --recovery-authorized-key ./recovery.pub \
   --bundle-version 1.0.0 \
+  --bundle-signature /var/lib/encvol/releases/encvol-installer-1.0.0.bundle.sig \
   --confirm WIPE:/dev/vdb \
   --execute
 ```
@@ -196,7 +210,11 @@ Never automate the typed confirmation with a broad shell script. The target must
 
 ## Installer-bundle ABI
 
-A release consists of a detached-base64 Ed25519 signature beside `encvol-installer-VERSION.bundle`. The bundle may contain only regular files named `kernel`, `initrd`, and `installer.efi`; `kernel` and `initrd` must occur together. An EFI fallback additionally needs `installer.efi`. The initramfs must invoke:
+A release consists of `encvol-installer-VERSION.bundle` and should publish a
+detached-base64 Ed25519 signature and SHA-256 checksum for explicit client
+verification. The bundle may contain only regular files named `kernel`,
+`initrd`, and `installer.efi`; `kernel` and `initrd` must occur together. An
+EFI fallback additionally needs `installer.efi`. The initramfs must invoke:
 
 ```text
 encvol installer-run --manifest /etc/encvol/manifest.json

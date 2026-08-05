@@ -353,7 +353,7 @@ set +e
   --bundle-version 0.0.0-qemu \
   --bundle-directory /var/lib/encvol/releases \
   --confirm WIPE:/dev/vdb \
-  --execute --allow-unsigned-bundle
+  --execute
 status=$?
 echo "encvol: source client exited ${status}"
 poweroff -f
