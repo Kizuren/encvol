@@ -18,6 +18,12 @@ while (($#)); do
 done
 [[ -n $artifacts && -n $suite ]] || { printf '%s\n' 'missing --artifacts or --suite' >&2; exit 2; }
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { printf '%s\n' 'fixture builder must run as root (the runner is invoked with sudo)' >&2; exit 77; }
+case "$artifacts" in
+    /|/tmp|/var|/var/tmp)
+        printf 'refusing unsafe QEMU artifact directory: %s\n' "$artifacts" >&2
+        exit 2
+        ;;
+esac
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 mirror=${ENCVOL_QEMU_DEBIAN_MIRROR:-http://deb.debian.org/debian}
@@ -43,6 +49,9 @@ else
     cargo build --release --manifest-path "$repo_root/Cargo.toml"
 fi
 
+for generated in apt certs disks guest manifests qemu rootfs secrets services source-root rootfs-root tang; do
+    rm -rf -- "$artifacts/$generated"
+done
 mkdir -p "$artifacts"/{apt,certs,disks,guest,manifests,qemu,rootfs,secrets,services,source-root,rootfs-root,tang}
 chmod 0700 "$artifacts/secrets"
 

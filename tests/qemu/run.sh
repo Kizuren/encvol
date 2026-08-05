@@ -97,6 +97,15 @@ run_guest_suite() {
     "$repo_root/tests/qemu/run-case.sh" --artifacts "$artifacts" --suite "$1" "${case_args[@]}"
 }
 
+run_all_guest_suites() {
+    require_qemu_host
+    local case_args=()
+    [[ -z $case_name ]] || case_args=(--case "$case_name")
+    "$repo_root/tests/qemu/build-fixtures.sh" --artifacts "$artifacts" --suite all "${case_args[@]}"
+    "$repo_root/tests/qemu/run-case.sh" --artifacts "$artifacts" --suite bios "${case_args[@]}"
+    "$repo_root/tests/qemu/run-case.sh" --artifacts "$artifacts" --suite uefi "${case_args[@]}"
+}
+
 cd "$repo_root"
 case "$suite" in
     unit) run_fast ;;
@@ -104,8 +113,7 @@ case "$suite" in
     bios|uefi) run_guest_suite "$suite" ;;
     all)
         run_fast
-        run_guest_suite bios
-        run_guest_suite uefi
+        run_all_guest_suites
         ;;
 esac
 printf 'artifacts: %s\n' "$artifacts"
