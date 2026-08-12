@@ -30,6 +30,10 @@ fn fixture_digest() -> String {
     "45a0411266ae7d50c423ee8599933f8d155512eec0e79f01468be7ec005cd60b".into()
 }
 
+fn fixture_public_key() -> &'static str {
+    "35b3db59f8b0a95f1a026d1ae18e76c4b46cfeea9b541186314b1d9b98da02ad"
+}
+
 #[test]
 fn bundle_verify_without_signature_warns_but_validates_structure() {
     let dir = tempdir().unwrap();
@@ -43,7 +47,7 @@ fn bundle_verify_without_signature_warns_but_validates_structure() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("verified installer fixture"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("(none)"));
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("WARNING: installer bundle has no signature or checksum verification"));
+        .contains("WARNING: installer bundle has no signature verification"));
 
     fs::remove_file(dir.path().join("encvol-installer-fixture.bundle.sig")).unwrap();
     let output = binary()
@@ -103,6 +107,8 @@ fn bundle_verify_signature_flag_is_strict() {
         .arg(dir.path())
         .arg("--signature")
         .arg(&signature)
+        .arg("--public-key")
+        .arg(fixture_public_key())
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -115,6 +121,8 @@ fn bundle_verify_signature_flag_is_strict() {
         .arg(dir.path())
         .arg("--signature")
         .arg(&signature)
+        .arg("--public-key")
+        .arg(fixture_public_key())
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -129,13 +137,23 @@ fn bundle_verify_signature_flag_is_strict() {
         .arg(dir.path())
         .arg("--signature")
         .arg(&signature)
+        .arg("--public-key")
+        .arg(fixture_public_key())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let output = binary()
+        .args(["bundle", "verify", "--version", "fixture", "--directory"])
+        .arg(dir.path())
+        .arg("--signature")
+        .arg(&signature)
         .output()
         .unwrap();
     assert!(!output.status.success());
 }
 
 #[test]
-fn bundle_verify_checksum_mode_warns_and_rejects_mismatch() {
+fn bundle_verify_rejects_removed_checksum_mode() {
     let dir = tempdir().unwrap();
     copy_fixture(dir.path());
 
@@ -144,18 +162,6 @@ fn bundle_verify_checksum_mode_warns_and_rejects_mismatch() {
         .arg(dir.path())
         .arg("--sha256")
         .arg(format!("SHA256:{}", fixture_digest().to_ascii_uppercase()))
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("(checksum)"));
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("checksum does not prove publisher authenticity"));
-
-    let output = binary()
-        .args(["bundle", "verify", "--version", "fixture", "--directory"])
-        .arg(dir.path())
-        .arg("--sha256")
-        .arg("0".repeat(64))
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -179,7 +185,7 @@ fn unsigned_verification_does_not_allow_an_unsafe_bundle() {
         .lines()
         .next()
         .unwrap()
-        .contains("WARNING: installer bundle has no signature or checksum verification"));
+        .contains("WARNING: installer bundle has no signature verification"));
 }
 
 #[test]
@@ -221,6 +227,8 @@ fn bundle_fetch_cannot_bypass_a_bad_downloaded_signature() {
             &format!("http://{address}/"),
             "--signature-url",
             &format!("http://{address}/encvol-installer-fixture.bundle.sig"),
+            "--public-key",
+            fixture_public_key(),
             "--directory",
         ])
         .arg(destination.path())
@@ -274,7 +282,7 @@ fn bundle_fetch_without_signature_warns_and_stores_bundle() {
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("(none)"));
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("WARNING: installer bundle has no signature or checksum verification"));
+        .contains("WARNING: installer bundle has no signature verification"));
     assert!(destination
         .path()
         .join("encvol-installer-fixture.bundle")

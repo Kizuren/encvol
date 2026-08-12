@@ -1,6 +1,6 @@
 # encvol
 
-`encvol` reinstalls an amd64 VPS onto an encrypted LUKS2/LVM layout. It first creates a reviewable plan, then—only with an exact typed confirmation—stages a signed RAM-resident installer for a one-time boot. The installer verifies the rootfs archive before it changes the target disk.
+`encvol` reinstalls an amd64 VPS onto an encrypted LUKS2/LVM layout. It first creates a reviewable plan, then—only with an exact typed confirmation—stages a RAM-resident installer for a one-time boot. The installer verifies the rootfs archive before it changes the target disk.
 
 This is an administrative, destructive tool. Keep provider-console access and the LUKS recovery passphrase available throughout the installation.
 
@@ -8,7 +8,7 @@ This is an administrative, destructive tool. Keep provider-console access and th
 
 - An amd64 Debian-compatible root filesystem.
 - An HTTPS location for the rootfs archive and descriptor.
-- A signed `encvol-installer-VERSION.bundle` and matching `.sig` in the bundle directory. Rootfs packaging does not create this separate installer bundle.
+- An `encvol-installer-VERSION.bundle` in the bundle directory. For signature verification, also provide its detached `.sig` and the signer public key. Rootfs packaging does not create this separate installer bundle.
 - A reachable Tang server and its pinned thumbprint.
 - A one-line OpenSSH public key for initramfs recovery access.
 - A machine where the selected whole disk can be erased.
@@ -113,28 +113,25 @@ sudo target/release/encvol install \
 
 Add `--data-volume` when a separate LVM data volume is wanted. The default layout uses all non-swap LVM space for the root volume.
 
-## Installer release key custody
+## Installer Bundle Trust
 
-The pinned Ed25519 release public key is compiled into `src/bundle.rs`. The
-approved signed fixture in `tests/fixtures/` proves normal verification in the
-test suite. It is not an EFI executable and must never be used to boot a VM.
+`encvol` does not compile in, publish, or pin an installer signing key. Each
+operator owns their installer bundle and, if they want signature verification,
+supplies the matching Ed25519 public key at verification time. The approved
+signed fixture in `tests/fixtures/` proves signature verification in the test
+suite. It is not an EFI executable and must never be used to boot a VM.
 
 Verify a published local release before staging it:
 
 ```sh
 target/release/encvol bundle verify --version VERSION \
   --directory /var/lib/encvol/releases \
-  --signature /var/lib/encvol/releases/encvol-installer-VERSION.bundle.sig
+  --signature /var/lib/encvol/releases/encvol-installer-VERSION.bundle.sig \
+  --public-key RAW_ED25519_PUBLIC_KEY_HEX
 ```
 
-If you only have an independently published checksum, pass
-`--sha256 HEX_DIGEST` or `--sha256 sha256:HEX_DIGEST`. Checksum-only mode
-protects against accidental corruption but does not prove publisher
-authenticity.
-
-Generate a replacement release key on the release host only. The private key
-is encrypted, root-owned, mode `0600`, and is never copied into this
-repository:
+Generate an operator signing key on the release host only. The private key is
+encrypted, root-owned, mode `0600`, and is never copied into this repository:
 
 ```sh
 sudo install -d -o root -g root -m 0700 /var/lib/encvol-release
@@ -145,8 +142,9 @@ sudo openssl pkey -in /var/lib/encvol-release/signing-key.pem \
   -pubout -outform DER | tail -c 32 | xxd -p -c 256
 ```
 
-Review that last value and update `RELEASE_PUBLIC_KEY_HEX`; then sign the
-exact bundle bytes interactively (the command prompts for the key passphrase):
+Record that last value as the public key hex to pass to `--public-key` or
+`--bundle-public-key`; then sign the exact bundle bytes interactively (the
+command prompts for the key passphrase):
 
 ```sh
 sudo openssl pkeyutl -sign \
@@ -154,7 +152,8 @@ sudo openssl pkeyutl -sign \
   -in encvol-installer-VERSION.bundle | base64 -w 0 \
   > encvol-installer-VERSION.bundle.sig
 target/release/encvol bundle verify --version VERSION --directory . \
-  --signature encvol-installer-VERSION.bundle.sig
+  --signature encvol-installer-VERSION.bundle.sig \
+  --public-key RAW_ED25519_PUBLIC_KEY_HEX
 ```
 
 The detached signature is standard base64 text over the exact, unmodified
@@ -162,21 +161,18 @@ bundle bytes. Do not copy the encrypted key to a build worker or substitute an
 environment variable, command-line option, or non-interactive passphrase for
 the prompt.
 
-For rotation, publish and test a release under the new key, update the pinned
-public key in a client release, and retain the prior key only for the defined
-transition window. Clients must be upgraded to the new pinned public key before
-they can verify bundles signed by it. Never put a passphrase, private key,
-derived key, or recovery secret in shell history, repository files, test
-artifacts, or logs.
+For rotation, publish and test a release under the new key, distribute the new
+public key through your own operational channel, and retain the prior key only
+for the defined transition window. Never put a passphrase, private key, derived
+key, or recovery secret in shell history, repository files, test artifacts, or
+logs.
 
 Installer bundle signatures are optional but recommended. `install`, `bundle
 verify`, and `bundle fetch` warn when no signature is supplied. A signature is
-provided explicitly with `--bundle-signature` for `install`, `--signature` for
-`bundle verify`, or `--signature-url` for `bundle fetch`. Checksum verification
-is available with `--bundle-sha256` or `--sha256`; checksum-only mode also
-warns because it is an integrity check, not an authenticity check. Tar and
-boot-component validation is always enforced, even without signature or
-checksum material.
+provided explicitly with `--bundle-signature` and `--bundle-public-key` for
+`install`, `--signature` and `--public-key` for `bundle verify`, or
+`--signature-url` and `--public-key` for `bundle fetch`. Tar and boot-component
+validation is always enforced, even without signature material.
 
 ## Local QEMU runbook
 
@@ -190,8 +186,8 @@ while a case runs. SeaBIOS covers BIOS and OVMF covers UEFI.
 
 `--execute` is the final, disk-changing step. It stages the installer bundle
 and reboots once into RAM; the RAM installer repeats the safety and rootfs
-checksum checks before wiping the disk. Pass `--bundle-signature` to
-authenticate the bundle before staging it.
+checksum checks before wiping the disk. Pass `--bundle-signature` and
+`--bundle-public-key` to authenticate the bundle before staging it.
 
 ```sh
 sudo target/release/encvol install \
@@ -202,6 +198,7 @@ sudo target/release/encvol install \
   --recovery-authorized-key ./recovery.pub \
   --bundle-version 1.0.0 \
   --bundle-signature /var/lib/encvol/releases/encvol-installer-1.0.0.bundle.sig \
+  --bundle-public-key RAW_ED25519_PUBLIC_KEY_HEX \
   --confirm WIPE:/dev/vdb \
   --execute
 ```
@@ -211,10 +208,11 @@ Never automate the typed confirmation with a broad shell script. The target must
 ## Installer-bundle ABI
 
 A release consists of `encvol-installer-VERSION.bundle` and should publish a
-detached-base64 Ed25519 signature and SHA-256 checksum for explicit client
-verification. The bundle may contain only regular files named `kernel`,
-`initrd`, and `installer.efi`; `kernel` and `initrd` must occur together. An
-EFI fallback additionally needs `installer.efi`. The initramfs must invoke:
+detached-base64 Ed25519 signature for explicit client verification with the
+operator-supplied public key. The bundle may contain only regular files named
+`kernel`, `initrd`, and `installer.efi`; `kernel` and `initrd` must occur
+together. An EFI fallback additionally needs `installer.efi`. The initramfs
+must invoke:
 
 ```text
 encvol installer-run --manifest /etc/encvol/manifest.json

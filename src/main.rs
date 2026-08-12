@@ -82,9 +82,9 @@ struct InstallArgs {
     /// Detached Ed25519 signature for the local installer bundle.
     #[arg(long)]
     bundle_signature: Option<PathBuf>,
-    /// Expected SHA-256 checksum for the local installer bundle.
+    /// Raw Ed25519 public key hex used to verify --bundle-signature.
     #[arg(long)]
-    bundle_sha256: Option<String>,
+    bundle_public_key: Option<String>,
 }
 #[derive(Subcommand)]
 enum RootfsCommand {
@@ -141,9 +141,9 @@ enum BundleCommand {
         /// URL of a detached Ed25519 signature for the installer bundle.
         #[arg(long)]
         signature_url: Option<Url>,
-        /// Expected SHA-256 checksum for the installer bundle.
+        /// Raw Ed25519 public key hex used to verify --signature-url.
         #[arg(long)]
-        sha256: Option<String>,
+        public_key: Option<String>,
         #[arg(
             long,
             env = "ENCVOL_BUNDLE_DIR",
@@ -163,9 +163,9 @@ enum BundleCommand {
         /// Detached Ed25519 signature for the installer bundle.
         #[arg(long)]
         signature: Option<PathBuf>,
-        /// Expected SHA-256 checksum for the installer bundle.
+        /// Raw Ed25519 public key hex used to verify --signature.
         #[arg(long)]
-        sha256: Option<String>,
+        public_key: Option<String>,
     },
 }
 
@@ -188,25 +188,21 @@ fn main() -> Result<()> {
                     version,
                     directory,
                     signature,
-                    sha256,
+                    public_key,
                 },
         } => {
             if !bundle::valid_version(&version) {
                 bail!("invalid bundle version")
             };
-            let policy = bundle_policy(signature.as_deref(), sha256.as_deref());
-            warn_bundle_verification(bundle_policy_from_presence(
-                signature.is_some(),
-                sha256.is_some(),
-            ));
+            let policy = bundle_policy(signature.as_deref(), public_key.as_deref())?;
+            warn_bundle_verification(bundle_verification_from_policy(policy)?);
             let result = bundle::verify_bundle_with_policy(
                 &bundle::bundle_path(&directory, &version),
                 policy,
             )
             .map_err(anyhow::Error::msg)?;
             println!(
-                "verified installer {version}: sha256:{} ({})",
-                result.sha256,
+                "verified installer {version}: ({})",
                 result.verification.as_str()
             );
         }
@@ -216,23 +212,23 @@ fn main() -> Result<()> {
                     version,
                     base_url,
                     signature_url,
-                    sha256,
+                    public_key,
                     directory,
                 },
         } => {
-            let policy = bundle_policy_from_presence(signature_url.is_some(), sha256.is_some());
+            let policy =
+                bundle_verification_from_presence(signature_url.is_some(), public_key.is_some())?;
             warn_bundle_verification(policy);
             let (_, _, result) = bundle::fetch_bundle(
                 &base_url,
                 &version,
                 &directory,
                 signature_url.as_ref(),
-                sha256.as_deref(),
+                public_key.as_deref(),
             )
             .map_err(anyhow::Error::msg)?;
             println!(
-                "fetched installer {version}: sha256:{} ({})",
-                result.sha256,
+                "fetched installer {version}: ({})",
                 result.verification.as_str()
             );
         }
@@ -276,10 +272,10 @@ fn install(args: InstallArgs) -> Result<()> {
         }),
     };
     manifest.validate().map_err(anyhow::Error::msg)?;
-    let requested_verification = bundle_policy_from_presence(
+    let requested_verification = bundle_verification_from_presence(
         args.bundle_signature.is_some(),
-        args.bundle_sha256.is_some(),
-    );
+        args.bundle_public_key.is_some(),
+    )?;
     let plan = installer::build_plan_with_bundle_verification(
         &manifest,
         report.handoff,
@@ -300,8 +296,8 @@ fn install(args: InstallArgs) -> Result<()> {
         .join(&args.bundle_version);
     let policy = bundle_policy(
         args.bundle_signature.as_deref(),
-        args.bundle_sha256.as_deref(),
-    );
+        args.bundle_public_key.as_deref(),
+    )?;
     let mut installer_bundle = bundle::stage_bundle_with_policy(
         &bundle::bundle_path(&args.bundle_directory, &args.bundle_version),
         &stage,
@@ -324,31 +320,39 @@ fn install(args: InstallArgs) -> Result<()> {
 
 fn bundle_policy<'a>(
     signature: Option<&'a std::path::Path>,
-    checksum: Option<&'a str>,
-) -> bundle::VerificationPolicy<'a> {
-    bundle::VerificationPolicy {
+    public_key_hex: Option<&'a str>,
+) -> Result<bundle::VerificationPolicy<'a>> {
+    let policy = bundle::VerificationPolicy {
         signature,
-        checksum,
-    }
+        public_key_hex,
+    };
+    bundle_verification_from_policy(policy)?;
+    Ok(policy)
 }
 
-fn bundle_policy_from_presence(signature: bool, checksum: bool) -> bundle::BundleVerification {
-    match (signature, checksum) {
-        (true, true) => bundle::BundleVerification::SignatureAndChecksum,
-        (true, false) => bundle::BundleVerification::Signature,
-        (false, true) => bundle::BundleVerification::Checksum,
-        (false, false) => bundle::BundleVerification::None,
+fn bundle_verification_from_policy(
+    policy: bundle::VerificationPolicy<'_>,
+) -> Result<bundle::BundleVerification> {
+    bundle_verification_from_presence(policy.signature.is_some(), policy.public_key_hex.is_some())
+}
+
+fn bundle_verification_from_presence(
+    signature: bool,
+    public_key: bool,
+) -> Result<bundle::BundleVerification> {
+    match (signature, public_key) {
+        (true, true) => Ok(bundle::BundleVerification::Signature),
+        (true, false) => bail!("signature verification requires --public-key"),
+        (false, true) => bail!("signature public key requires a signature"),
+        (false, false) => Ok(bundle::BundleVerification::None),
     }
 }
 
 fn warn_bundle_verification(verification: bundle::BundleVerification) {
     match verification {
-        bundle::BundleVerification::Signature | bundle::BundleVerification::SignatureAndChecksum => {}
-        bundle::BundleVerification::Checksum => eprintln!(
-            "WARNING: installer bundle is verified only by SHA-256 checksum; checksum does not prove publisher authenticity"
-        ),
+        bundle::BundleVerification::Signature => {}
         bundle::BundleVerification::None => eprintln!(
-            "WARNING: installer bundle has no signature or checksum verification; only bundle structure will be checked"
+            "WARNING: installer bundle has no signature verification; only bundle structure will be checked"
         ),
     }
 }

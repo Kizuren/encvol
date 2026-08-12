@@ -10,16 +10,9 @@ use std::{
     thread,
 };
 
-/// Release key for the installer artifact channel. Releases are signed over the
-/// exact bundle bytes; this is not a checksum-only authenticity check.
-pub const RELEASE_PUBLIC_KEY_HEX: &str =
-    "35b3db59f8b0a95f1a026d1ae18e76c4b46cfeea9b541186314b1d9b98da02ad";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleVerification {
     Signature,
-    SignatureAndChecksum,
-    Checksum,
     None,
 }
 
@@ -27,8 +20,6 @@ impl BundleVerification {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Signature => "signature",
-            Self::SignatureAndChecksum => "signature+checksum",
-            Self::Checksum => "checksum",
             Self::None => "none",
         }
     }
@@ -37,21 +28,21 @@ impl BundleVerification {
 #[derive(Debug, Clone, Copy)]
 pub struct VerificationPolicy<'a> {
     pub signature: Option<&'a Path>,
-    pub checksum: Option<&'a str>,
+    pub public_key_hex: Option<&'a str>,
 }
 
 impl<'a> VerificationPolicy<'a> {
     pub fn unsigned() -> Self {
         Self {
             signature: None,
-            checksum: None,
+            public_key_hex: None,
         }
     }
 
-    pub fn with_signature(signature: &'a Path) -> Self {
+    pub fn with_signature(signature: &'a Path, public_key_hex: &'a str) -> Self {
         Self {
             signature: Some(signature),
-            checksum: None,
+            public_key_hex: Some(public_key_hex),
         }
     }
 }
@@ -74,26 +65,34 @@ pub fn verify_signature(
     public_key_hex: &str,
 ) -> Result<(), EncvolError> {
     let key_bytes = hex::decode(public_key_hex)
-        .map_err(|_| EncvolError::Verification("release public key is malformed".into()))?;
+        .map_err(|_| EncvolError::Verification("signature public key is malformed".into()))?;
     let key: [u8; 32] = key_bytes
         .try_into()
-        .map_err(|_| EncvolError::Verification("release public key has wrong length".into()))?;
+        .map_err(|_| EncvolError::Verification("signature public key has wrong length".into()))?;
     let signature = Signature::from_slice(signature)
         .map_err(|_| EncvolError::Verification("signature is malformed".into()))?;
     VerifyingKey::from_bytes(&key)
-        .map_err(|_| EncvolError::Verification("release public key is invalid".into()))?
+        .map_err(|_| EncvolError::Verification("signature public key is invalid".into()))?
         .verify(payload, &signature)
         .map_err(|_| EncvolError::Verification("installer signature did not verify".into()))
 }
 
-pub fn verify_bundle(bundle: &Path, signature: &Path) -> Result<String, EncvolError> {
-    Ok(verify_bundle_with_policy(bundle, VerificationPolicy::with_signature(signature))?.sha256)
+pub fn verify_bundle(
+    bundle: &Path,
+    signature: &Path,
+    public_key_hex: &str,
+) -> Result<String, EncvolError> {
+    Ok(verify_bundle_with_policy(
+        bundle,
+        VerificationPolicy::with_signature(signature, public_key_hex),
+    )?
+    .sha256)
 }
 
 /// Verify according to `policy` and always validate the bundle ABI.  A missing
 /// signature is allowed by design, but the caller must emit an appropriate
-/// warning because checksum-only or structure-only checks do not authenticate
-/// the installer bundle.
+/// warning because structure-only checks do not authenticate the installer
+/// bundle.
 pub fn verify_bundle_with_policy(
     bundle: &Path,
     policy: VerificationPolicy<'_>,
@@ -109,19 +108,21 @@ fn read_verified_bundle(
     let artifact = fs::read(bundle)
         .map_err(|e| EncvolError::Verification(format!("cannot read bundle: {e}")))?;
     let digest = sha256_hex(&artifact);
-    if let Some(expected) = policy.checksum {
-        verify_checksum(&digest, expected)?;
-    }
-    let verification = match (policy.signature, policy.checksum) {
-        (Some(signature), Some(_)) => {
-            verify_detached_signature(&artifact, signature)?;
-            BundleVerification::SignatureAndChecksum
-        }
-        (Some(signature), None) => {
-            verify_detached_signature(&artifact, signature)?;
+    let verification = match (policy.signature, policy.public_key_hex) {
+        (Some(signature), Some(public_key_hex)) => {
+            verify_detached_signature(&artifact, signature, public_key_hex)?;
             BundleVerification::Signature
         }
-        (None, Some(_)) => BundleVerification::Checksum,
+        (Some(_), None) => {
+            return Err(EncvolError::Verification(
+                "signature verification requires --public-key".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(EncvolError::Verification(
+                "signature public key requires a signature".into(),
+            ))
+        }
         (None, None) => BundleVerification::None,
     };
     validate_bundle_structure(&artifact)?;
@@ -134,38 +135,16 @@ fn read_verified_bundle(
     ))
 }
 
-fn normalize_checksum(checksum: &str) -> Result<String, EncvolError> {
-    let checksum = checksum.trim();
-    let checksum = checksum
-        .strip_prefix("sha256:")
-        .or_else(|| checksum.strip_prefix("SHA256:"))
-        .unwrap_or(checksum);
-    if checksum.len() == 64 && checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(checksum.to_ascii_lowercase())
-    } else {
-        Err(EncvolError::Verification(
-            "bundle SHA-256 checksum must be 64 hexadecimal characters".into(),
-        ))
-    }
-}
-
-fn verify_checksum(actual: &str, expected: &str) -> Result<(), EncvolError> {
-    let expected = normalize_checksum(expected)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(EncvolError::Verification(
-            "bundle SHA-256 checksum did not verify".into(),
-        ))
-    }
-}
-
-fn verify_detached_signature(artifact: &[u8], signature: &Path) -> Result<(), EncvolError> {
+fn verify_detached_signature(
+    artifact: &[u8],
+    signature: &Path,
+    public_key_hex: &str,
+) -> Result<(), EncvolError> {
     let text = fs::read_to_string(signature)
         .map_err(|e| EncvolError::Verification(format!("cannot read signature: {e}")))?;
     let sig = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim())
         .map_err(|_| EncvolError::Verification("signature is not base64".into()))?;
-    verify_signature(artifact, &sig, RELEASE_PUBLIC_KEY_HEX)
+    verify_signature(artifact, &sig, public_key_hex)
 }
 
 pub fn download(url: &url::Url) -> Result<Vec<u8>, EncvolError> {
@@ -407,14 +386,15 @@ fn zstd_compress(cpio: &[u8]) -> Result<Vec<u8>, EncvolError> {
     )
 }
 
-/// Fetch a versioned artifact into a caller-owned directory.  Optional
-/// signature/checksum material is verified before storing the artifact.
+/// Fetch a versioned artifact into a caller-owned directory. Optional signature
+/// material is verified with the operator-supplied public key before storing
+/// the artifact.
 pub fn fetch_bundle(
     base: &url::Url,
     version: &str,
     destination: &Path,
     signature_url: Option<&url::Url>,
-    checksum: Option<&str>,
+    public_key_hex: Option<&str>,
 ) -> Result<(PathBuf, Option<PathBuf>, BundleVerificationResult), EncvolError> {
     if !valid_version(version) {
         return Err(EncvolError::Verification("invalid bundle version".into()));
@@ -436,29 +416,26 @@ pub fn fetch_bundle(
         None
     };
     let digest = sha256_hex(&artifact);
-    if let Some(expected) = checksum {
-        verify_checksum(&digest, expected)?;
-    }
-    let verification = match (signature_text.as_deref(), checksum) {
-        (Some(signature_text), Some(_)) => {
+    let verification = match (signature_text.as_deref(), public_key_hex) {
+        (Some(signature_text), Some(public_key_hex)) => {
             let sig = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 signature_text.trim(),
             )
             .map_err(|_| EncvolError::Verification("signature is not base64".into()))?;
-            verify_signature(&artifact, &sig, RELEASE_PUBLIC_KEY_HEX)?;
-            BundleVerification::SignatureAndChecksum
-        }
-        (Some(signature_text), None) => {
-            let sig = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                signature_text.trim(),
-            )
-            .map_err(|_| EncvolError::Verification("signature is not base64".into()))?;
-            verify_signature(&artifact, &sig, RELEASE_PUBLIC_KEY_HEX)?;
+            verify_signature(&artifact, &sig, public_key_hex)?;
             BundleVerification::Signature
         }
-        (None, Some(_)) => BundleVerification::Checksum,
+        (Some(_), None) => {
+            return Err(EncvolError::Verification(
+                "signature verification requires --public-key".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(EncvolError::Verification(
+                "signature public key requires --signature-url".into(),
+            ))
+        }
         (None, None) => BundleVerification::None,
     };
     validate_bundle_structure(&artifact)?;
@@ -505,12 +482,13 @@ pub fn valid_version(version: &str) -> bool {
 pub fn stage_bundle(
     bundle: &Path,
     signature: &Path,
+    public_key_hex: &str,
     destination: &Path,
 ) -> Result<StagedBundle, EncvolError> {
     stage_bundle_with_policy(
         bundle,
         destination,
-        VerificationPolicy::with_signature(signature),
+        VerificationPolicy::with_signature(signature, public_key_hex),
     )
 }
 
@@ -697,6 +675,10 @@ mod tests {
         out
     }
 
+    fn fixture_public_key() -> &'static str {
+        "35b3db59f8b0a95f1a026d1ae18e76c4b46cfeea9b541186314b1d9b98da02ad"
+    }
+
     fn bundle_with_raw_name(name: &[u8]) -> Vec<u8> {
         let mut out = bundle(&[("installer.efi", b"unsafe")]);
         assert!(name.len() < 100);
@@ -749,11 +731,12 @@ mod tests {
     }
 
     #[test]
-    fn approved_fixture_verifies_under_the_pinned_release_key() {
+    fn approved_fixture_verifies_with_an_operator_public_key() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let digest = verify_bundle(
             &root.join("approved-installer.bundle"),
             &root.join("approved-installer.bundle.sig"),
+            fixture_public_key(),
         )
         .unwrap();
         assert_eq!(
@@ -769,7 +752,7 @@ mod tests {
         let signature = dir.path().join("installer.bundle.sig");
         fs::write(&artifact, bundle(&[("installer.efi", b"placeholder")])).unwrap();
 
-        assert!(verify_bundle(&artifact, &signature).is_err());
+        assert!(verify_bundle(&artifact, &signature, fixture_public_key()).is_err());
         let result = verify_bundle_with_policy(&artifact, VerificationPolicy::unsigned()).unwrap();
         assert_eq!(result.verification, BundleVerification::None);
 
@@ -778,30 +761,26 @@ mod tests {
     }
 
     #[test]
-    fn checksum_policy_accepts_normalized_sha256_and_rejects_mismatch() {
+    fn signature_policy_requires_both_signature_and_public_key() {
         let dir = tempdir().unwrap();
         let artifact = dir.path().join("installer.bundle");
-        let bytes = bundle(&[("installer.efi", b"placeholder")]);
-        let digest = sha256_hex(&bytes);
-        fs::write(&artifact, bytes).unwrap();
+        let signature = dir.path().join("installer.bundle.sig");
+        fs::write(&artifact, bundle(&[("installer.efi", b"placeholder")])).unwrap();
 
-        let upper = format!("SHA256:{}", digest.to_ascii_uppercase());
-        let result = verify_bundle_with_policy(
+        assert!(verify_bundle_with_policy(
             &artifact,
             VerificationPolicy {
-                signature: None,
-                checksum: Some(&upper),
+                signature: Some(&signature),
+                public_key_hex: None,
             },
         )
-        .unwrap();
-        assert_eq!(result.sha256, digest);
-        assert_eq!(result.verification, BundleVerification::Checksum);
+        .is_err());
 
         assert!(verify_bundle_with_policy(
             &artifact,
             VerificationPolicy {
                 signature: None,
-                checksum: Some(&"0".repeat(64)),
+                public_key_hex: Some(fixture_public_key()),
             },
         )
         .is_err());
@@ -893,7 +872,7 @@ mod tests {
         fs::copy(fixture.join("approved-installer.bundle.sig"), &signature).unwrap();
 
         fs::write(&signature, "untrusted signature input\n").unwrap();
-        let error = verify_bundle(&artifact, &signature)
+        let error = verify_bundle(&artifact, &signature, fixture_public_key())
             .unwrap_err()
             .to_string();
         assert!(!error.contains("untrusted signature input"));
@@ -901,11 +880,11 @@ mod tests {
         let wrong_signature =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 64]);
         fs::write(&signature, wrong_signature).unwrap();
-        assert!(verify_bundle(&artifact, &signature).is_err());
+        assert!(verify_bundle(&artifact, &signature, fixture_public_key()).is_err());
 
         fs::copy(fixture.join("approved-installer.bundle.sig"), &signature).unwrap();
         fs::write(&artifact, bundle(&[("installer.efi", b"tampered")])).unwrap();
-        assert!(verify_bundle(&artifact, &signature).is_err());
+        assert!(verify_bundle(&artifact, &signature, fixture_public_key()).is_err());
         assert!(verify_bundle_with_policy(&artifact, VerificationPolicy::unsigned()).is_ok());
     }
 

@@ -111,9 +111,12 @@ mod tests {
 
     #[test]
     fn records_bundle_verification_mode_in_review_plan() {
-        let plan =
-            build_plan_with_bundle_verification(&m(), Handoff::Kexec, BundleVerification::Checksum)
-                .unwrap();
-        assert_eq!(plan.bundle_verification, "checksum");
+        let plan = build_plan_with_bundle_verification(
+            &m(),
+            Handoff::Kexec,
+            BundleVerification::Signature,
+        )
+        .unwrap();
+        assert_eq!(plan.bundle_verification, "signature");
     }
 }
