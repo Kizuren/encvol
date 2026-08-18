@@ -12,11 +12,18 @@ mirror=${ENCVOL_ROOTFS_MIRROR:-https://deb.debian.org/debian}
 disk_size=${ENCVOL_ROOTFS_DISK_SIZE:-12G}
 ssh_port=${ENCVOL_ROOTFS_SSH_PORT:-2222}
 ssh_key=${ENCVOL_ROOTFS_SSH_KEY:-}
+guest_hostname=${ENCVOL_ROOTFS_HOSTNAME:-}
+guest_user=${ENCVOL_ROOTFS_USER:-}
 memory=${ENCVOL_ROOTFS_MEMORY_MB:-2048}
 cpus=${ENCVOL_ROOTFS_CPUS:-2}
 format=tar.zst
 output=
 archive_url=
+root_password=
+user_password=
+password_ssh=0
+qemu_command=()
+release_set=0
 
 usage() {
     cat <<'EOF'
@@ -24,12 +31,15 @@ usage:
   sudo scripts/qemu-rootfs.sh init [options]
   scripts/qemu-rootfs.sh start [options]
   sudo scripts/qemu-rootfs.sh pack --archive-url URL [options]
+  sudo scripts/qemu-rootfs.sh customize --archive-url URL [options]
 
 options:
   --workdir DIR       State directory. Default: /srv/encvol/trixie-qemu
   --release NAME      Debian release. Default: trixie
   --mirror URL        Debian mirror. Default: https://deb.debian.org/debian
-  --ssh-key PATH      Public key installed for root and encvol SSH.
+  --hostname NAME     Guest hostname. Default: encvol-RELEASE
+  --user NAME         Primary login user. Default: encvol
+  --ssh-key PATH      Public key installed for root and the primary user.
   --ssh-port PORT     Host SSH port forwarded to the guest. Default: 2222
   --disk-size SIZE    QEMU root disk size for init. Default: 12G
   --memory MB         QEMU memory for start. Default: 2048
@@ -43,8 +53,10 @@ EOF
 while (($#)); do
     case $1 in
         --workdir) workdir=${2:?missing workdir}; shift 2 ;;
-        --release) release=${2:?missing release}; shift 2 ;;
+        --release) release=${2:?missing release}; release_set=1; shift 2 ;;
         --mirror) mirror=${2:?missing mirror}; shift 2 ;;
+        --hostname) guest_hostname=${2:?missing hostname}; shift 2 ;;
+        --user) guest_user=${2:?missing user}; shift 2 ;;
         --ssh-key) ssh_key=${2:?missing ssh key}; shift 2 ;;
         --ssh-port) ssh_port=${2:?missing ssh port}; shift 2 ;;
         --disk-size) disk_size=${2:?missing disk size}; shift 2 ;;
@@ -61,6 +73,29 @@ done
 disk="$workdir/rootfs.raw"
 kernel="$workdir/vmlinuz"
 initrd="$workdir/initrd.img"
+state_file="$workdir/rootfs.env"
+
+load_state() {
+    [[ -r $state_file ]] || return 0
+    local key value
+    while IFS='=' read -r key value; do
+        case $key in
+            release) ((release_set)) || release=$value ;;
+            hostname) [[ -n $guest_hostname ]] || guest_hostname=$value ;;
+            user) [[ -n $guest_user ]] || guest_user=$value ;;
+        esac
+    done < "$state_file"
+}
+
+write_state() {
+    cat > "$state_file" <<EOF
+release=$release
+hostname=$guest_hostname
+user=$guest_user
+EOF
+}
+
+load_state
 
 default_ssh_key() {
     if [[ -n $ssh_key ]]; then
@@ -151,9 +186,103 @@ copy_boot_artifacts() {
     install -m 0644 "$source_initrd" "$initrd"
 }
 
+valid_hostname() {
+    [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+valid_user() {
+    [[ $1 =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]
+}
+
+ask_default() {
+    local prompt=$1 default=$2 answer=
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+    read -r answer
+    printf '%s\n' "${answer:-$default}"
+}
+
+ask_yes_no() {
+    local prompt=$1 answer=
+    printf '%s [y/N]: ' "$prompt" >&2
+    read -r answer
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
+}
+
+ask_password_twice() {
+    local label=$1 first= second=
+    while true; do
+        printf '%s password: ' "$label" >&2
+        read -r -s first
+        printf '\n' >&2
+        printf 'Confirm %s password: ' "$label" >&2
+        read -r -s second
+        printf '\n' >&2
+        [[ $first == "$second" ]] || {
+            printf '%s\n' 'passwords did not match; try again' >&2
+            continue
+        }
+        [[ $first != *:* ]] || {
+            printf '%s\n' 'passwords cannot contain :' >&2
+            continue
+        }
+        printf '%s\n' "$first"
+        return
+    done
+}
+
+collect_init_config() {
+    if [[ -z $guest_hostname ]]; then
+        if [[ -t 0 ]]; then
+            guest_hostname=$(ask_default 'Hostname' "encvol-${release}")
+        else
+            guest_hostname="encvol-${release}"
+        fi
+    fi
+    valid_hostname "$guest_hostname" || {
+        printf 'invalid hostname: %s\n' "$guest_hostname" >&2
+        exit 2
+    }
+
+    if [[ -z $guest_user ]]; then
+        if [[ -t 0 ]]; then
+            guest_user=$(ask_default 'Primary user' encvol)
+        else
+            guest_user=encvol
+        fi
+    fi
+    valid_user "$guest_user" || {
+        printf 'invalid user: %s\n' "$guest_user" >&2
+        exit 2
+    }
+    [[ $guest_user != root ]] || {
+        printf '%s\n' 'primary user must not be root; root is configured separately' >&2
+        exit 2
+    }
+
+    if [[ -t 0 ]]; then
+        if ask_yes_no 'Set a root password'; then
+            root_password=$(ask_password_twice root)
+        fi
+        if ask_yes_no "Set a password for $guest_user"; then
+            user_password=$(ask_password_twice "$guest_user")
+        fi
+        if [[ -n $root_password || -n $user_password ]]; then
+            if ask_yes_no 'Allow password SSH login in this rootfs'; then
+                password_ssh=1
+            fi
+        fi
+    fi
+}
+
+set_chroot_password() {
+    local user=$1 password=$2
+    printf '%s:%s\n' "$user" "$password" | chroot "$mount_dir" /usr/sbin/chpasswd
+}
+
 init_rootfs() {
     require_root
     require_tools qemu-img debootstrap mkfs.ext4 mount umount install chroot find sort tail
+    collect_init_config
     local key
     key=$(default_ssh_key)
     [[ -r $key ]] || {
@@ -174,10 +303,10 @@ init_rootfs() {
     packages=systemd-sysv,linux-image-amd64,openssh-server,sudo,ca-certificates,curl,vim-tiny,iproute2,dbus,passwd
     debootstrap --arch=amd64 --include="$packages" "$release" "$mount_dir" "$mirror"
 
-    printf 'encvol-%s\n' "$release" > "$mount_dir/etc/hostname"
+    printf '%s\n' "$guest_hostname" > "$mount_dir/etc/hostname"
     cat > "$mount_dir/etc/hosts" <<EOF
 127.0.0.1 localhost
-127.0.1.1 encvol-${release}
+127.0.1.1 ${guest_hostname}
 EOF
     cat > "$mount_dir/etc/fstab" <<'EOF'
 /dev/vda / ext4 defaults 0 1
@@ -201,24 +330,35 @@ EOF
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 EOF
-
-    chroot "$mount_dir" /usr/sbin/groupadd -f encvol
-    if ! chroot "$mount_dir" /usr/bin/id -u encvol >/dev/null 2>&1; then
-        chroot "$mount_dir" /usr/sbin/useradd -m -g encvol -s /bin/bash encvol
+    if ((password_ssh)); then
+        sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' \
+            "$mount_dir/etc/ssh/sshd_config.d/90-encvol-qemu.conf"
     fi
-    mkdir -p "$mount_dir/home/encvol/.ssh" "$mount_dir/etc/sudoers.d"
-    install -m 0600 "$key" "$mount_dir/home/encvol/.ssh/authorized_keys"
-    local encvol_uid encvol_gid
-    encvol_uid=$(chroot "$mount_dir" /usr/bin/id -u encvol)
-    encvol_gid=$(chroot "$mount_dir" /usr/bin/id -g encvol)
-    chown -R "$encvol_uid:$encvol_gid" "$mount_dir/home/encvol/.ssh"
-    printf 'encvol ALL=(ALL) NOPASSWD:ALL\n' > "$mount_dir/etc/sudoers.d/encvol"
-    chmod 0440 "$mount_dir/etc/sudoers.d/encvol"
+
+    chroot "$mount_dir" /usr/sbin/groupadd -f "$guest_user"
+    if ! chroot "$mount_dir" /usr/bin/id -u "$guest_user" >/dev/null 2>&1; then
+        chroot "$mount_dir" /usr/sbin/useradd -m -g "$guest_user" -s /bin/bash "$guest_user"
+    fi
+    mkdir -p "$mount_dir/home/$guest_user/.ssh" "$mount_dir/etc/sudoers.d"
+    install -m 0600 "$key" "$mount_dir/home/$guest_user/.ssh/authorized_keys"
+    local guest_uid guest_gid
+    guest_uid=$(chroot "$mount_dir" /usr/bin/id -u "$guest_user")
+    guest_gid=$(chroot "$mount_dir" /usr/bin/id -g "$guest_user")
+    chown -R "$guest_uid:$guest_gid" "$mount_dir/home/$guest_user/.ssh"
+    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$guest_user" > "$mount_dir/etc/sudoers.d/$guest_user"
+    chmod 0440 "$mount_dir/etc/sudoers.d/$guest_user"
+    if [[ -n $root_password ]]; then
+        set_chroot_password root "$root_password"
+    fi
+    if [[ -n $user_password ]]; then
+        set_chroot_password "$guest_user" "$user_password"
+    fi
     : > "$mount_dir/etc/machine-id"
 
     copy_boot_artifacts "$mount_dir"
     cleanup_mount
     mounted=
+    write_state
 
     if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
         chown -R "$SUDO_USER:${SUDO_GID:-$(id -g "$SUDO_USER")}" "$workdir"
@@ -227,7 +367,7 @@ EOF
     printf 'boot it with: scripts/qemu-rootfs.sh start --workdir %q\n' "$workdir"
 }
 
-start_rootfs() {
+qemu_args() {
     require_tools qemu-system-x86_64
     [[ -r $disk && -r $kernel && -r $initrd ]] || {
         printf 'missing QEMU state in %s; run init first\n' "$workdir" >&2
@@ -235,7 +375,7 @@ start_rootfs() {
     }
     local accel=()
     [[ -r /dev/kvm && -w /dev/kvm ]] && accel=(-enable-kvm)
-    local args=(
+    qemu_command=(
         qemu-system-x86_64
         "${accel[@]}"
         -m "$memory"
@@ -248,11 +388,21 @@ start_rootfs() {
         -append "root=/dev/vda rw console=ttyS0 systemd.unit=multi-user.target net.ifnames=0"
         -nographic
     )
-    printf 'SSH after boot: ssh -p %s encvol@127.0.0.1\n' "$ssh_port"
+}
+
+run_qemu() {
+    qemu_args
+    printf 'SSH after boot: ssh -p %s %s@127.0.0.1\n' "$ssh_port" "$guest_user"
     if [[ ${EUID:-$(id -u)} -eq 0 && -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
-        exec sudo -u "$SUDO_USER" -- "${args[@]}"
+        sudo -u "$SUDO_USER" -- "${qemu_command[@]}"
+    else
+        "${qemu_command[@]}"
     fi
-    exec "${args[@]}"
+}
+
+start_rootfs() {
+    [[ -n $guest_user ]] || guest_user=encvol
+    run_qemu
 }
 
 pack_rootfs() {
@@ -283,10 +433,19 @@ pack_rootfs() {
     printf 'rootfs archive: %s\n' "$output"
 }
 
+customize_rootfs() {
+    require_root
+    [[ -n $guest_user ]] || guest_user=encvol
+    run_qemu
+    printf '%s\n' 'guest exited; packing rootfs'
+    pack_rootfs
+}
+
 case "$action" in
     init) init_rootfs ;;
     start) start_rootfs ;;
     pack) pack_rootfs ;;
+    customize) customize_rootfs ;;
     --help|-h|'') usage ;;
     *) usage >&2; exit 2 ;;
 esac

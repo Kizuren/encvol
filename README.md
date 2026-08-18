@@ -82,10 +82,17 @@ Use the QEMU helper when you want to boot the rootfs, SSH into it, make normal
 system changes, then export that filesystem for a VPS install:
 
 ```sh
-sudo scripts/qemu-rootfs.sh init --ssh-key ~/.ssh/id_ed25519.pub
+sudo scripts/qemu-rootfs.sh init \
+  --hostname trixie-vps \
+  --user kizu \
+  --ssh-key ~/.ssh/id_ed25519.pub
 scripts/qemu-rootfs.sh start
-ssh -p 2222 encvol@127.0.0.1
+ssh -p 2222 kizu@127.0.0.1
 ```
+
+`init` prompts for the hostname, primary user, optional root password, optional
+user password, and whether password SSH should be enabled in the customization
+rootfs. SSH key login is always configured for root and the primary user.
 
 Shut the guest down cleanly when customization is done:
 
@@ -97,6 +104,15 @@ Then pack the same guest filesystem as the rootfs artifact you will publish:
 
 ```sh
 sudo scripts/qemu-rootfs.sh pack \
+  --archive-url https://images.example/encvol/trixie-root.tar.zst \
+  --output /srv/encvol/publish/trixie-root.tar.zst
+```
+
+Or use the combined flow: it boots the guest, waits for it to power off, then
+packs the rootfs automatically:
+
+```sh
+sudo scripts/qemu-rootfs.sh customize \
   --archive-url https://images.example/encvol/trixie-root.tar.zst \
   --output /srv/encvol/publish/trixie-root.tar.zst
 ```
