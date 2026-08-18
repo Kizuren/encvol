@@ -41,19 +41,25 @@ done
     exit 77
 }
 
-if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
-    user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    sudo -u "$SUDO_USER" -- env HOME="$user_home" PATH="$user_home/.cargo/bin:$PATH" \
-        cargo build --release --manifest-path "$repo_root/Cargo.toml"
-else
-    cargo build --release --manifest-path "$repo_root/Cargo.toml"
-fi
-
 for generated in apt certs disks guest manifests qemu rootfs secrets services source-root rootfs-root tang; do
     rm -rf -- "$artifacts/$generated"
 done
 mkdir -p "$artifacts"/{apt,certs,disks,guest,manifests,qemu,rootfs,secrets,services,source-root,rootfs-root,tang}
 chmod 0700 "$artifacts/secrets"
+
+run_cargo() {
+    if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+        local user_home
+        user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        sudo -u "$SUDO_USER" -- env HOME="$user_home" PATH="$user_home/.cargo/bin:$PATH" "$@"
+    else
+        "$@"
+    fi
+}
+
+run_cargo env ENCVOL_BOOTSTRAP_WITHOUT_INSTALLER_BUNDLE=1 \
+    cargo build --release --manifest-path "$repo_root/Cargo.toml"
+install -D -m 0755 "$repo_root/target/release/encvol" "$artifacts/qemu/bootstrap-encvol"
 
 # The recovery passphrase is generated for a runner that needs it, but is not
 # put into a bundle, image, command line, manifest, log, or fixture metadata.
@@ -136,20 +142,6 @@ ln -sf /lib/systemd/system/systemd-networkd.service "$rootfs_root/etc/systemd/sy
 ln -sf /lib/systemd/system/ssh.service "$rootfs_root/etc/systemd/system/multi-user.target.wants/ssh.service" || true
 rm -f "$rootfs_root/etc/ssh/ssh_host_"*key*
 
-# Package both accepted formats and write descriptors consumed by the client
-# and directly by installer cases.  Do not include transient host mountpoints.
-tar --numeric-owner --xattrs --acls --sparse \
-    --exclude=./dev --exclude=./proc --exclude=./sys --exclude=./run --exclude=./tmp \
-    -C "$rootfs_root" -cf "$artifacts/rootfs/bookworm-root.tar" .
-zstd -q -T0 -f "$artifacts/rootfs/bookworm-root.tar" -o "$artifacts/rootfs/bookworm-root.tar.zst"
-for format in tar tar.zst; do
-    archive="$artifacts/rootfs/bookworm-root.$format"
-    digest=$(sha256sum "$archive" | awk '{print $1}')
-    cat > "$artifacts/rootfs/bookworm-root.$format.json" <<EOF
-{"schema_version":1,"archive_url":"https://${gateway}/rootfs/bookworm-root.${format}","sha256":"${digest}","release":"${release}","architecture":"amd64","provides":["systemd","apt","debian-package-compatibility"],"format":"${format}"}
-EOF
-done
-
 # Source disk is a separate raw ext4 image: vda is never handed to the
 # installer and vdb is always a fresh qcow2 target.  The old paths are kept as
 # a stable fixture contract for individual case scripts.
@@ -159,14 +151,12 @@ mkfs.ext4 -q -F "$source_raw"
 mount -o loop "$source_raw" "$source_root"
 mount_root=1
 tar --numeric-owner -C "$rootfs_root" -cf - . | tar --numeric-owner -C "$source_root" -xf -
-install -D -m 0755 "$repo_root/target/release/encvol" "$source_root/usr/local/bin/encvol"
+install -D -m 0755 "$artifacts/qemu/bootstrap-encvol" "$source_root/usr/local/bin/encvol"
 install -m 0644 "$artifacts/certs/ca.crt" "$source_root/usr/local/share/ca-certificates/encvol-qemu.crt"
 install -D -m 0644 "$artifacts/guest/recovery-key.pub" "$source_root/root/encvol-recovery.pub"
-mkdir -p "$source_root/var/lib/encvol/releases"
 
-# An unsigned, structurally bootable bundle is intentional: the source image
-# uses the explicit local-test bypass and strict signature cases use the
-# committed approved fixture independently.  It is never fetchable.
+# Build the RAM installer from a bootstrap encvol. installer-run does not need
+# an embedded bundle; only the source-side install command does.
 installer_root="$source_root"
 mkdir -p "$installer_root/etc/initramfs-tools/hooks" "$installer_root/etc/initramfs-tools/scripts/local-top"
 cat > "$installer_root/etc/initramfs-tools/hooks/encvol-qemu" <<'EOF'
@@ -306,16 +296,36 @@ install -m 0644 "$initrd" "$artifacts/qemu/installer.initrd"
 
 bundle_dir="$artifacts/guest/bundles"
 mkdir -p "$bundle_dir"
+embedded_bundle="$bundle_dir/encvol-installer-${version}.bundle"
 tar -C "$artifacts/qemu" \
     --transform='s|installer.kernel|kernel|' --transform='s|installer.initrd|initrd|' \
-    -cf "$bundle_dir/encvol-installer-${version}.bundle" installer.kernel installer.initrd
-cp "$bundle_dir/encvol-installer-${version}.bundle" "$source_root/var/lib/encvol/releases/encvol-installer-${version}.bundle"
+    -cf "$embedded_bundle" installer.kernel installer.initrd
+
+run_cargo env ENCVOL_INSTALLER_BUNDLE="$embedded_bundle" \
+    cargo build --release --manifest-path "$repo_root/Cargo.toml"
+install -D -m 0755 "$repo_root/target/release/encvol" "$artifacts/guest/encvol"
+install -D -m 0755 "$repo_root/target/release/encvol" "$rootfs_root/usr/local/bin/encvol"
+install -D -m 0755 "$repo_root/target/release/encvol" "$source_root/usr/local/bin/encvol"
+
+# Package both accepted formats and write descriptors consumed by the client
+# and directly by installer cases. Do not include transient host mountpoints.
+tar --numeric-owner --xattrs --acls --sparse \
+    --exclude=./dev --exclude=./proc --exclude=./sys --exclude=./run --exclude=./tmp \
+    -C "$rootfs_root" -cf "$artifacts/rootfs/bookworm-root.tar" .
+zstd -q -T0 -f "$artifacts/rootfs/bookworm-root.tar" -o "$artifacts/rootfs/bookworm-root.tar.zst"
+for format in tar tar.zst; do
+    archive="$artifacts/rootfs/bookworm-root.$format"
+    digest=$(sha256sum "$archive" | awk '{print $1}')
+    cat > "$artifacts/rootfs/bookworm-root.$format.json" <<EOF
+{"schema_version":1,"archive_url":"https://${gateway}/rootfs/bookworm-root.${format}","sha256":"${digest}","release":"${release}","architecture":"amd64","provides":["systemd","apt","debian-package-compatibility"],"format":"${format}"}
+EOF
+done
 
 # A source boot is inert unless the recipe explicitly adds
 # encvol.qemu.source=1.  With that opt-in it exercises the public client path:
 # download descriptor over the private HTTPS service, build a manifest, stage
-# the local unsigned bundle with the visible bypass, then request the normal
-# kexec handoff.  This is intentionally not a hidden direct installer call.
+# the embedded installer bundle, then request the normal kexec handoff. This is
+# intentionally not a hidden direct installer call.
 install -D -m 0755 /dev/stdin "$source_root/usr/local/lib/encvol-qemu-source-run" <<'EOF'
 #!/bin/sh
 set -eu
@@ -359,8 +369,6 @@ set +e
   --recovery-authorized-key /root/encvol-recovery.pub \
   --swap-mib 1024 \
   ${data_args} \
-  --bundle-version 0.0.0-qemu \
-  --bundle-directory /var/lib/encvol/releases \
   --confirm WIPE:/dev/vdb \
   --execute
 status=$?

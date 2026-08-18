@@ -1,6 +1,5 @@
 //! RAM-installer operations expressed as a reviewable sequence.
 use crate::{
-    bundle::BundleVerification,
     handoff::Handoff,
     manifest::{InstallationManifest, Layout},
     EncvolError,
@@ -11,21 +10,12 @@ use serde::Serialize;
 pub struct InstallerPlan {
     pub target_disk: String,
     pub firmware: String,
-    pub bundle_verification: String,
     pub steps: Vec<String>,
 }
 
 pub fn build_plan(
     manifest: &InstallationManifest,
     handoff: Handoff,
-) -> Result<InstallerPlan, EncvolError> {
-    build_plan_with_bundle_verification(manifest, handoff, BundleVerification::None)
-}
-
-pub fn build_plan_with_bundle_verification(
-    manifest: &InstallationManifest,
-    handoff: Handoff,
-    bundle_verification: BundleVerification,
 ) -> Result<InstallerPlan, EncvolError> {
     manifest.validate()?;
     if handoff == Handoff::Unsupported {
@@ -43,7 +33,7 @@ pub fn build_plan_with_bundle_verification(
         "bios-or-uefi"
     };
     let mut steps=vec![
-        "validate installer bundle, manifest, target disk, and rootfs SHA-256 in RAM".into(),
+        "validate embedded installer, manifest, target disk, and rootfs SHA-256 in RAM".into(),
         format!("wipe partition table on {} only after revalidation", manifest.target_disk),
         if firmware=="uefi" { "create EFI System Partition and LUKS2 partition".into() } else { "create BIOS boot partition and LUKS2 partition (UEFI boots use ESP when selected)".into() },
         "create LUKS2 -> LVM -> ext4 root and swap volumes using remaining capacity".into(),
@@ -58,7 +48,6 @@ pub fn build_plan_with_bundle_verification(
     Ok(InstallerPlan {
         target_disk: manifest.target_disk.clone(),
         firmware: firmware.into(),
-        bundle_verification: bundle_verification.as_str().into(),
         steps,
     })
 }
@@ -107,16 +96,5 @@ mod tests {
             .steps
             .join(" ")
             .contains("without placing a volume key on ESP"));
-    }
-
-    #[test]
-    fn records_bundle_verification_mode_in_review_plan() {
-        let plan = build_plan_with_bundle_verification(
-            &m(),
-            Handoff::Kexec,
-            BundleVerification::Signature,
-        )
-        .unwrap();
-        assert_eq!(plan.bundle_verification, "signature");
     }
 }

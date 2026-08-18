@@ -34,10 +34,6 @@ enum Top {
         #[command(subcommand)]
         command: RootfsCommand,
     },
-    Bundle {
-        #[command(subcommand)]
-        command: BundleCommand,
-    },
     #[command(hide = true)]
     InstallerRun(InstallerRunArgs),
 }
@@ -67,24 +63,9 @@ struct InstallArgs {
     /// Exact acknowledgement: WIPE:/dev/the-selected-disk
     #[arg(long)]
     confirm: Option<String>,
-    /// Signed installer release version already stored in --bundle-directory.
-    #[arg(long)]
-    bundle_version: String,
-    #[arg(
-        long,
-        env = "ENCVOL_BUNDLE_DIR",
-        default_value = "/var/lib/encvol/releases"
-    )]
-    bundle_directory: PathBuf,
     /// Stage the verified installer and reboot through the selected handoff.
     #[arg(long)]
     execute: bool,
-    /// Detached Ed25519 signature for the local installer bundle.
-    #[arg(long)]
-    bundle_signature: Option<PathBuf>,
-    /// Raw Ed25519 public key hex used to verify --bundle-signature.
-    #[arg(long)]
-    bundle_public_key: Option<String>,
 }
 #[derive(Subcommand)]
 enum RootfsCommand {
@@ -131,44 +112,6 @@ struct InstallerRunArgs {
     #[arg(long, hide = true)]
     allow_non_ram: bool,
 }
-#[derive(Subcommand)]
-enum BundleCommand {
-    Fetch {
-        #[arg(long)]
-        version: String,
-        #[arg(long)]
-        base_url: Url,
-        /// URL of a detached Ed25519 signature for the installer bundle.
-        #[arg(long)]
-        signature_url: Option<Url>,
-        /// Raw Ed25519 public key hex used to verify --signature-url.
-        #[arg(long)]
-        public_key: Option<String>,
-        #[arg(
-            long,
-            env = "ENCVOL_BUNDLE_DIR",
-            default_value = "/var/lib/encvol/releases"
-        )]
-        directory: PathBuf,
-    },
-    Verify {
-        #[arg(long)]
-        version: String,
-        #[arg(
-            long,
-            env = "ENCVOL_BUNDLE_DIR",
-            default_value = "/var/lib/encvol/releases"
-        )]
-        directory: PathBuf,
-        /// Detached Ed25519 signature for the installer bundle.
-        #[arg(long)]
-        signature: Option<PathBuf>,
-        /// Raw Ed25519 public key hex used to verify --signature.
-        #[arg(long)]
-        public_key: Option<String>,
-    },
-}
-
 fn main() -> Result<()> {
     match Cli::parse().command {
         Top::Preflight(args) => {
@@ -182,56 +125,6 @@ fn main() -> Result<()> {
                 bail!("host has no supported handoff")
             }
         }
-        Top::Bundle {
-            command:
-                BundleCommand::Verify {
-                    version,
-                    directory,
-                    signature,
-                    public_key,
-                },
-        } => {
-            if !bundle::valid_version(&version) {
-                bail!("invalid bundle version")
-            };
-            let policy = bundle_policy(signature.as_deref(), public_key.as_deref())?;
-            warn_bundle_verification(bundle_verification_from_policy(policy)?);
-            let result = bundle::verify_bundle_with_policy(
-                &bundle::bundle_path(&directory, &version),
-                policy,
-            )
-            .map_err(anyhow::Error::msg)?;
-            println!(
-                "verified installer {version}: ({})",
-                result.verification.as_str()
-            );
-        }
-        Top::Bundle {
-            command:
-                BundleCommand::Fetch {
-                    version,
-                    base_url,
-                    signature_url,
-                    public_key,
-                    directory,
-                },
-        } => {
-            let policy =
-                bundle_verification_from_presence(signature_url.is_some(), public_key.is_some())?;
-            warn_bundle_verification(policy);
-            let (_, _, result) = bundle::fetch_bundle(
-                &base_url,
-                &version,
-                &directory,
-                signature_url.as_ref(),
-                public_key.as_deref(),
-            )
-            .map_err(anyhow::Error::msg)?;
-            println!(
-                "fetched installer {version}: ({})",
-                result.verification.as_str()
-            );
-        }
         Top::Install(args) => install(args)?,
         Top::Rootfs { command } => rootfs_command(command)?,
         Top::InstallerRun(args) => installer_run(args)?,
@@ -240,6 +133,15 @@ fn main() -> Result<()> {
 }
 
 fn install(args: InstallArgs) -> Result<()> {
+    let embedded_bundle = if args.execute {
+        Some(bundle::EMBEDDED_INSTALLER_BUNDLE.ok_or_else(|| {
+            anyhow::anyhow!(
+                "this encvol binary was built without an embedded installer bundle; use a release binary or rebuild with ENCVOL_INSTALLER_BUNDLE=/path/to/bundle"
+            )
+        })?)
+    } else {
+        None
+    };
     safety::validate_disk_path(&args.disk).map_err(anyhow::Error::msg)?;
     safety::require_confirmation(&args.disk, args.confirm.as_deref())
         .map_err(anyhow::Error::msg)?;
@@ -272,36 +174,17 @@ fn install(args: InstallArgs) -> Result<()> {
         }),
     };
     manifest.validate().map_err(anyhow::Error::msg)?;
-    let requested_verification = bundle_verification_from_presence(
-        args.bundle_signature.is_some(),
-        args.bundle_public_key.is_some(),
-    )?;
-    let plan = installer::build_plan_with_bundle_verification(
-        &manifest,
-        report.handoff,
-        requested_verification,
-    )
-    .map_err(anyhow::Error::msg)?;
-    warn_bundle_verification(requested_verification);
+    let plan = installer::build_plan(&manifest, report.handoff).map_err(anyhow::Error::msg)?;
     if !args.execute {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
     }
-    if !bundle::valid_version(&args.bundle_version) {
-        bail!("invalid bundle version")
-    }
-    let stage = args
-        .bundle_directory
-        .join("staged")
-        .join(&args.bundle_version);
-    let policy = bundle_policy(
-        args.bundle_signature.as_deref(),
-        args.bundle_public_key.as_deref(),
-    )?;
-    let mut installer_bundle = bundle::stage_bundle_with_policy(
-        &bundle::bundle_path(&args.bundle_directory, &args.bundle_version),
+    let stage = PathBuf::from("/var/lib/encvol/staged")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join(std::process::id().to_string());
+    let mut installer_bundle = bundle::stage_bundle_bytes(
+        embedded_bundle.expect("checked when --execute is set"),
         &stage,
-        policy,
     )
     .map_err(anyhow::Error::msg)?;
     eprintln!("encvol: staged installer bundle");
@@ -311,50 +194,11 @@ fn install(args: InstallArgs) -> Result<()> {
     handoff::execute_handoff(
         report.handoff,
         &installer_bundle,
-        &args.bundle_version,
+        env!("CARGO_PKG_VERSION"),
         report.capabilities.writable_esp.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
     Ok(())
-}
-
-fn bundle_policy<'a>(
-    signature: Option<&'a std::path::Path>,
-    public_key_hex: Option<&'a str>,
-) -> Result<bundle::VerificationPolicy<'a>> {
-    let policy = bundle::VerificationPolicy {
-        signature,
-        public_key_hex,
-    };
-    bundle_verification_from_policy(policy)?;
-    Ok(policy)
-}
-
-fn bundle_verification_from_policy(
-    policy: bundle::VerificationPolicy<'_>,
-) -> Result<bundle::BundleVerification> {
-    bundle_verification_from_presence(policy.signature.is_some(), policy.public_key_hex.is_some())
-}
-
-fn bundle_verification_from_presence(
-    signature: bool,
-    public_key: bool,
-) -> Result<bundle::BundleVerification> {
-    match (signature, public_key) {
-        (true, true) => Ok(bundle::BundleVerification::Signature),
-        (true, false) => bail!("signature verification requires --public-key"),
-        (false, true) => bail!("signature public key requires a signature"),
-        (false, false) => Ok(bundle::BundleVerification::None),
-    }
-}
-
-fn warn_bundle_verification(verification: bundle::BundleVerification) {
-    match verification {
-        bundle::BundleVerification::Signature => {}
-        bundle::BundleVerification::None => eprintln!(
-            "WARNING: installer bundle has no signature verification; only bundle structure will be checked"
-        ),
-    }
 }
 
 fn rootfs_command(command: RootfsCommand) -> Result<()> {

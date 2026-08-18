@@ -55,8 +55,7 @@ pre_faults=(
     missing-installer-flag non-ram-root invalid-target mounted-target
     invalid-confirmation rootfs-unavailable rootfs-wrong-hash
     rootfs-malformed-descriptor rootfs-malformed-archive rootfs-unsupported-format
-    tang-unavailable missing-executable unsupported-handoff unsigned-bundle
-    malformed-signature tampered-bundle
+    tang-unavailable missing-executable unsupported-handoff
 )
 post_faults=(
     wipefs partition luks-format luks-open pvcreate vgcreate lvcreate filesystem

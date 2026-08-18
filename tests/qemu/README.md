@@ -38,18 +38,21 @@ always creates these paths:
 - `qemu/installer.kernel` and `qemu/installer.initrd` — RAM-installer boot
   inputs. `stage-manifest.sh --artifacts DIR --format tar|tar.zst` creates a
   disposable initrd with the selected manifest appended as a newc overlay.
+- `guest/bundles/encvol-installer-0.0.0-qemu.bundle` — the generated installer
+  bundle embedded into the final source-side `encvol` binary.
+- `guest/encvol` — the final release-mode binary with that bundle embedded.
 - `rootfs/bookworm-root.tar` and `.tar.zst`, with matching descriptors and
   SHA-256 values; each rootfs contains an in-image flat local APT repository.
 - `services/https` and `certs/` — a per-run TLS service root and certificate.
   Start `serve-https.py` only after binding its address to the private bridge.
-- `manifests/installer-{tar,tar.zst}.json`, an unsigned bootable local test
-  bundle, recovery public key, and `fixtures.json` metadata.
+- `manifests/installer-{tar,tar.zst}.json`, recovery public key, and
+  `fixtures.json` metadata.
 
 The source image has an opt-in systemd service.  Boot it with
 `encvol.qemu.source=1` to exercise the public `encvol install --execute`
-path, including the explicit unsigned-local warning and kexec handoff.  A
-plain source boot emits `encvol: disposable source fixture ready` and powers
-off, which is useful for a non-destructive source-image check.
+path with the embedded installer bundle and kexec handoff.  A plain source boot
+emits `encvol: disposable source fixture ready` and powers off, which is useful
+for a non-destructive source-image check.
 
 The builder makes a per-run recovery passphrase only in the root-only
 `secrets/` directory. It is never placed in an image, installer bundle,

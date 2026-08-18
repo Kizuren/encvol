@@ -1,0 +1,36 @@
+name: qemu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 qemu-utils debootstrap tang jose ovmf \
+            zstd cpio cryptsetup-bin lvm2 clevis clevis-luks clevis-initramfs \
+            dropbear-initramfs dosfstools gdisk kexec-tools \
+            iproute2 openssl openssh-client util-linux e2fsprogs tar gzip python3
+          if [ ! -x /usr/libexec/tangd ] && [ -x /usr/lib/x86_64-linux-gnu/tangd ]; then
+            sudo mkdir -p /usr/libexec
+            sudo ln -s /usr/lib/x86_64-linux-gnu/tangd /usr/libexec/tangd
+          fi
+          if [ ! -x /usr/libexec/tangd-keygen ] && [ -x /usr/lib/x86_64-linux-gnu/tangd-keygen ]; then
+            sudo mkdir -p /usr/libexec
+            sudo ln -s /usr/lib/x86_64-linux-gnu/tangd-keygen /usr/libexec/tangd-keygen
+          fi
+      - name: Run QEMU suite
+        run: sudo tests/qemu/run.sh --suite all
+      - name: Upload QEMU artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encvol-qemu-artifacts
+          path: /var/tmp/encvol-qemu
+          if-no-files-found: ignore

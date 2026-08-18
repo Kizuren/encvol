@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Make a disposable boot initramfs from the reusable unsigned test bundle.
+# Make a disposable boot initramfs from the reusable installer initrd.
 # The manifest is inserted into the initrd CPIO stream, exactly like
-# bundle::embed_manifest; the bundle itself remains immutable and contains no
+# bundle::embed_manifest; the base initrd remains immutable and contains no
 # machine-specific configuration.
 set -Eeuo pipefail
 
