@@ -169,63 +169,68 @@ case "${1:-}" in prereqs) prereqs; exit 0;; esac
 copy_optional_file() {
     [ ! -e "$1" ] || copy_file config "$1"
 }
+copy_exec_once() {
+    dest=${2:-$1}
+    [ ! -e "${DESTDIR}${dest}" ] || return 0
+    copy_exec "$@"
+}
 add_optional_module() {
     manual_add_modules "$1" || true
 }
-copy_exec /usr/local/bin/encvol
-copy_exec /usr/bin/ip
-copy_exec /usr/sbin/wipefs
-copy_exec /usr/sbin/sgdisk
-copy_exec /usr/sbin/cryptsetup
-copy_exec /usr/sbin/modprobe
-copy_exec /usr/sbin/pvcreate
-copy_exec /usr/sbin/vgcreate
-copy_exec /usr/sbin/lvcreate
+copy_exec_once /usr/local/bin/encvol
+copy_exec_once /usr/bin/ip
+copy_exec_once /usr/sbin/wipefs
+copy_exec_once /usr/sbin/sgdisk
+copy_exec_once /usr/sbin/cryptsetup
+copy_exec_once /usr/sbin/modprobe
+copy_exec_once /usr/sbin/pvcreate
+copy_exec_once /usr/sbin/vgcreate
+copy_exec_once /usr/sbin/lvcreate
 # BusyBox's initramfs hook may install applet hardlinks before this hook runs.
 # Replace them with the real e2fsprogs/util-linux binaries: the installer
 # requires ext4 support, while BusyBox provides mke2fs but not the mkfs.ext4
 # applet name used by the runtime command list.
 rm -f "${DESTDIR}/usr/sbin/mke2fs" "${DESTDIR}/usr/sbin/mkfs.ext4" "${DESTDIR}/usr/sbin/mkswap"
-copy_exec /usr/sbin/mke2fs /usr/sbin/mke2fs
+copy_exec_once /usr/sbin/mke2fs /usr/sbin/mke2fs
 ln -s mke2fs "${DESTDIR}/usr/sbin/mkfs.ext4"
-copy_exec /usr/sbin/mkswap /usr/sbin/mkswap
+copy_exec_once /usr/sbin/mkswap /usr/sbin/mkswap
 # dosfstools' mkfs.fat has no additional runtime dependency in some Debian
 # builds and `copy_exec` reports that as a non-zero optional-library result
 # after it has copied the executable. Keep the copied binary and continue.
-copy_exec /usr/sbin/mkfs.fat || true
+copy_exec_once /usr/sbin/mkfs.fat || true
 rm -f "${DESTDIR}/usr/bin/mount" "${DESTDIR}/usr/bin/tar" "${DESTDIR}/usr/sbin/chroot"
-copy_exec /usr/bin/mount /usr/bin/mount
-copy_exec /usr/bin/tar /usr/bin/tar
-copy_exec /usr/sbin/chroot /usr/sbin/chroot
-copy_exec /usr/bin/clevis
-copy_exec /usr/bin/clevis-luks-bind
-copy_exec /usr/bin/clevis-luks-common-functions
-copy_exec /usr/bin/clevis-encrypt-tang
-copy_exec /usr/bin/clevis-decrypt
-copy_exec /usr/bin/clevis-decrypt-tang
-copy_exec /usr/bin/jose
-copy_exec /usr/bin/curl
-copy_exec /usr/bin/luksmeta
-copy_exec /usr/bin/pwmake
-copy_exec /usr/bin/awk
-copy_exec /usr/bin/sed
-copy_exec /usr/bin/grep
-copy_exec /usr/bin/sort
-copy_exec /usr/bin/tail
-copy_exec /usr/bin/cat
-copy_exec /usr/bin/mktemp
-copy_exec /usr/bin/mkdir
-copy_exec /usr/bin/rm
-copy_exec /usr/bin/touch
-copy_exec /usr/bin/chmod
+copy_exec_once /usr/bin/mount /usr/bin/mount
+copy_exec_once /usr/bin/tar /usr/bin/tar
+copy_exec_once /usr/sbin/chroot /usr/sbin/chroot
+copy_exec_once /usr/bin/clevis
+copy_exec_once /usr/bin/clevis-luks-bind
+copy_exec_once /usr/bin/clevis-luks-common-functions
+copy_exec_once /usr/bin/clevis-encrypt-tang
+copy_exec_once /usr/bin/clevis-decrypt
+copy_exec_once /usr/bin/clevis-decrypt-tang
+copy_exec_once /usr/bin/jose
+copy_exec_once /usr/bin/curl
+copy_exec_once /usr/bin/luksmeta
+copy_exec_once /usr/bin/pwmake
+copy_exec_once /usr/bin/awk
+copy_exec_once /usr/bin/sed
+copy_exec_once /usr/bin/grep
+copy_exec_once /usr/bin/sort
+copy_exec_once /usr/bin/tail
+copy_exec_once /usr/bin/cat
+copy_exec_once /usr/bin/mktemp
+copy_exec_once /usr/bin/mkdir
+copy_exec_once /usr/bin/rm
+copy_exec_once /usr/bin/touch
+copy_exec_once /usr/bin/chmod
 copy_optional_file /etc/cracklib/cracklib.conf
 copy_optional_file /etc/security/pwquality.conf
 copy_file config /etc/passwd
 copy_optional_file /var/cache/cracklib/cracklib_dict.hwm
 copy_optional_file /var/cache/cracklib/cracklib_dict.pwd
 copy_optional_file /var/cache/cracklib/cracklib_dict.pwi
-[ ! -x /usr/bin/zstd ] || copy_exec /usr/bin/zstd
-copy_exec /usr/bin/systemd-ask-password
+[ ! -x /usr/bin/zstd ] || copy_exec_once /usr/bin/zstd
+copy_exec_once /usr/bin/systemd-ask-password
 copy_file config /etc/ssl/certs/ca-certificates.crt
 add_optional_module dm-mod
 add_optional_module dm-crypt
