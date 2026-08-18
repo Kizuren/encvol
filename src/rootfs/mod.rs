@@ -87,7 +87,7 @@ impl RootfsDescriptor {
     }
 }
 
-fn valid_release(value: &str) -> bool {
+pub(crate) fn valid_release(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()

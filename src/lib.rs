@@ -14,6 +14,7 @@ pub mod rootfs;
 pub mod runtime;
 pub mod safety;
 pub mod secrets;
+pub mod self_install;
 
 use thiserror::Error;
 

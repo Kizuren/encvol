@@ -11,7 +11,7 @@ use super::{
     Firmware, RuntimeOptions,
 };
 
-fn packages(firmware: Firmware) -> &'static [&'static str] {
+pub(super) fn packages(firmware: Firmware) -> &'static [&'static str] {
     match firmware {
         Firmware::Uefi => &[
             "linux-image-amd64",
@@ -72,7 +72,7 @@ fn cache_verified_rootfs(manifest: &InstallationManifest) -> Result<&'static Pat
     Ok(rootfs)
 }
 
-fn create_mountpoints() -> Result<(), EncvolError> {
+pub(super) fn create_mountpoints() -> Result<(), EncvolError> {
     fs::create_dir_all("/target")
         .map_err(|e| EncvolError::Unsupported(format!("cannot create target mountpoint: {e}")))?;
     Ok(())
@@ -139,7 +139,7 @@ fn create_layout(
     Ok(())
 }
 
-fn bind_chroot_mounts() -> Result<(), EncvolError> {
+pub(super) fn bind_chroot_mounts() -> Result<(), EncvolError> {
     for (source, target) in [
         ("/dev", "/target/dev"),
         ("/proc", "/target/proc"),
@@ -161,7 +161,7 @@ fn bind_chroot_mounts() -> Result<(), EncvolError> {
     Ok(())
 }
 
-fn install_target_packages(firmware: Firmware) -> Result<(), EncvolError> {
+pub(super) fn install_target_packages(firmware: Firmware) -> Result<(), EncvolError> {
     run_command(
         &[
             "chroot".into(),
@@ -182,7 +182,7 @@ fn install_target_packages(firmware: Firmware) -> Result<(), EncvolError> {
     run_command(&install_command, None)
 }
 
-fn bind_tang_slot(
+pub(super) fn bind_tang_slot(
     manifest: &InstallationManifest,
     recovery_passphrase: &[u8],
 ) -> Result<(), EncvolError> {
@@ -203,7 +203,7 @@ fn bind_tang_slot(
     )
 }
 
-fn install_bootloader(
+pub(super) fn install_bootloader(
     manifest: &InstallationManifest,
     firmware: Firmware,
 ) -> Result<(), EncvolError> {

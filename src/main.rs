@@ -2,11 +2,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use encvol::{
     bundle, handoff, installer,
-    manifest::{InstallationManifest, Layout},
+    manifest::{InstallationManifest, Layout, SelfInstallManifest},
     preflight,
     rootfs::{self, ArchiveFormat, RootfsDescriptor},
     runtime::{Firmware, RuntimeOptions},
-    safety,
+    safety, self_install,
 };
 use std::{
     env, fs,
@@ -30,6 +30,7 @@ struct Cli {
 enum Top {
     Preflight(PreflightArgs),
     Install(InstallArgs),
+    SelfInstall(SelfInstallArgs),
     Rootfs {
         #[command(subcommand)]
         command: RootfsCommand,
@@ -50,6 +51,31 @@ struct InstallArgs {
     disk: String,
     #[arg(long)]
     rootfs_descriptor: Url,
+    #[arg(long)]
+    tang_url: Url,
+    #[arg(long)]
+    tang_thumbprint: String,
+    #[arg(long)]
+    recovery_authorized_key: PathBuf,
+    #[arg(long, default_value_t = 1024)]
+    swap_mib: u64,
+    #[arg(long)]
+    data_volume: bool,
+    /// Exact acknowledgement: WIPE:/dev/the-selected-disk
+    #[arg(long)]
+    confirm: Option<String>,
+    /// Stage the verified installer and reboot through the selected handoff.
+    #[arg(long)]
+    execute: bool,
+}
+#[derive(Args)]
+struct SelfInstallArgs {
+    #[arg(long)]
+    disk: String,
+    #[arg(long)]
+    rootfs_descriptor: Option<Url>,
+    #[arg(long)]
+    use_live_root: bool,
     #[arg(long)]
     tang_url: Url,
     #[arg(long)]
@@ -126,22 +152,27 @@ fn main() -> Result<()> {
             }
         }
         Top::Install(args) => install(args)?,
+        Top::SelfInstall(args) => self_install_command(args)?,
         Top::Rootfs { command } => rootfs_command(command)?,
         Top::InstallerRun(args) => installer_run(args)?,
     }
     Ok(())
 }
 
-fn install(args: InstallArgs) -> Result<()> {
-    let embedded_bundle = if args.execute {
-        Some(bundle::EMBEDDED_INSTALLER_BUNDLE.ok_or_else(|| {
+fn embedded_bundle_for_execute(execute: bool) -> Result<Option<&'static [u8]>> {
+    if execute {
+        Ok(Some(bundle::EMBEDDED_INSTALLER_BUNDLE.ok_or_else(|| {
             anyhow::anyhow!(
                 "this encvol binary was built without an embedded installer bundle; use a release binary or rebuild with ENCVOL_INSTALLER_BUNDLE=/path/to/bundle"
             )
-        })?)
+        })?))
     } else {
-        None
-    };
+        Ok(None)
+    }
+}
+
+fn install(args: InstallArgs) -> Result<()> {
+    let embedded_bundle = embedded_bundle_for_execute(args.execute)?;
     safety::validate_disk_path(&args.disk).map_err(anyhow::Error::msg)?;
     safety::require_confirmation(&args.disk, args.confirm.as_deref())
         .map_err(anyhow::Error::msg)?;
@@ -196,6 +227,55 @@ fn install(args: InstallArgs) -> Result<()> {
         &installer_bundle,
         env!("CARGO_PKG_VERSION"),
         report.capabilities.writable_esp.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn self_install_command(args: SelfInstallArgs) -> Result<()> {
+    let embedded_bundle = embedded_bundle_for_execute(args.execute)?;
+    safety::require_confirmation(&args.disk, args.confirm.as_deref())
+        .map_err(anyhow::Error::msg)?;
+    let recovery_authorized_key = fs::read_to_string(&args.recovery_authorized_key)
+        .context("cannot read recovery authorized key")?
+        .trim()
+        .into();
+    let (manifest, plan, capabilities) = self_install::prepare(self_install::SelfInstallRequest {
+        disk: args.disk,
+        rootfs_descriptor: args.rootfs_descriptor,
+        use_live_root: args.use_live_root,
+        tang_url: args.tang_url,
+        tang_thumbprint: args.tang_thumbprint,
+        recovery_authorized_key,
+        swap_mib: args.swap_mib,
+        data_volume: args.data_volume,
+    })
+    .map_err(anyhow::Error::msg)?;
+    if !args.execute {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    let stage = PathBuf::from("/var/lib/encvol/staged")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join(std::process::id().to_string());
+    let mut installer_bundle = bundle::stage_bundle_bytes(
+        embedded_bundle.expect("checked when --execute is set"),
+        &stage,
+    )
+    .map_err(anyhow::Error::msg)?;
+    eprintln!("encvol: staged installer bundle");
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    fs::create_dir_all("/boot/encvol").context("cannot create /boot/encvol")?;
+    fs::write("/boot/encvol/self-install-manifest.json", &manifest_bytes)
+        .context("cannot stage self-install manifest in /boot/encvol")?;
+    bundle::embed_manifest(&mut installer_bundle, &manifest_bytes).map_err(anyhow::Error::msg)?;
+    eprintln!("encvol: embedded self-install manifest");
+    handoff::execute_handoff_with_args(
+        plan.handoff,
+        &installer_bundle,
+        env!("CARGO_PKG_VERSION"),
+        capabilities.writable_esp.as_deref(),
+        &["encvol.self_install=1"],
     )
     .map_err(anyhow::Error::msg)?;
     Ok(())
@@ -259,29 +339,51 @@ fn rootfs_command(command: RootfsCommand) -> Result<()> {
 
 fn installer_run(args: InstallerRunArgs) -> Result<()> {
     let text = fs::read(&args.manifest).context("cannot read installer manifest")?;
-    let manifest: InstallationManifest =
-        serde_json::from_slice(&text).context("installer manifest is not valid JSON")?;
-    safety::require_confirmation(
-        &manifest.target_disk,
-        std::env::var("ENCVOL_CONFIRM").ok().as_deref(),
-    )
-    .map_err(anyhow::Error::msg)?;
     let firmware = match args.firmware.as_str() {
         "uefi" => Firmware::Uefi,
         "bios" => Firmware::Bios,
         _ => unreachable!(),
     };
     let passphrase = ask_passphrase()?;
-    encvol::runtime::run(
-        &manifest,
-        &RuntimeOptions {
-            firmware,
-            execute: args.execute,
-            allow_non_ram: args.allow_non_ram,
-        },
-        &passphrase,
-    )
-    .map_err(anyhow::Error::msg)
+    let value: serde_json::Value =
+        serde_json::from_slice(&text).context("installer manifest is not valid JSON")?;
+    if value.get("mode").and_then(|mode| mode.as_str()) == Some("self-install") {
+        let manifest: SelfInstallManifest =
+            serde_json::from_value(value).context("self-install manifest is not valid")?;
+        safety::require_confirmation(
+            &manifest.target_disk,
+            std::env::var("ENCVOL_CONFIRM").ok().as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        encvol::runtime::run_self_install(
+            &manifest,
+            &RuntimeOptions {
+                firmware,
+                execute: args.execute,
+                allow_non_ram: args.allow_non_ram,
+            },
+            &passphrase,
+        )
+        .map_err(anyhow::Error::msg)
+    } else {
+        let manifest: InstallationManifest =
+            serde_json::from_value(value).context("installer manifest is not valid")?;
+        safety::require_confirmation(
+            &manifest.target_disk,
+            std::env::var("ENCVOL_CONFIRM").ok().as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        encvol::runtime::run(
+            &manifest,
+            &RuntimeOptions {
+                firmware,
+                execute: args.execute,
+                allow_non_ram: args.allow_non_ram,
+            },
+            &passphrase,
+        )
+        .map_err(anyhow::Error::msg)
+    }
 }
 
 fn ask_passphrase() -> Result<Vec<u8>> {

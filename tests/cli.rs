@@ -51,3 +51,38 @@ fn install_execute_without_embedded_bundle_fails_clearly() {
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("built without an embedded installer bundle"));
 }
+
+#[test]
+fn self_install_help_exposes_source_modes() {
+    let output = binary().args(["self-install", "--help"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--use-live-root"));
+    assert!(help.contains("--rootfs-descriptor"));
+    assert!(help.contains("--confirm"));
+}
+
+#[test]
+fn self_install_execute_without_embedded_bundle_fails_clearly() {
+    let output = binary()
+        .args([
+            "self-install",
+            "--disk",
+            "/dev/vda",
+            "--use-live-root",
+            "--tang-url",
+            "http://127.0.0.1:8080",
+            "--tang-thumbprint",
+            "pin",
+            "--recovery-authorized-key",
+            "/missing/recovery.pub",
+            "--confirm",
+            "WIPE:/dev/vda",
+            "--execute",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("built without an embedded installer bundle"));
+}

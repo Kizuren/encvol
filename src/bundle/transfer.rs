@@ -34,6 +34,27 @@ pub fn download_to_path(url: &url::Url, destination: &Path) -> Result<String, En
     copy_and_hash(response.into_reader(), file)
 }
 
+pub fn sha256_file(path: &Path) -> Result<String, EncvolError> {
+    let file = fs::File::open(path)
+        .map_err(|e| EncvolError::Unsupported(format!("cannot read file for SHA-256: {e}")))?;
+    hash_reader(file)
+}
+
+fn hash_reader(mut reader: impl Read) -> Result<String, EncvolError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| EncvolError::Unsupported(format!("cannot read file for SHA-256: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 pub(crate) fn copy_and_hash(
     mut reader: impl Read,
     mut writer: impl Write,

@@ -14,7 +14,7 @@ pub use fetch::fetch_bundle;
 pub use initrd::embed_manifest;
 pub use paths::{bundle_path, signature_path, valid_version};
 pub use stage::{stage_bundle, stage_bundle_bytes, stage_bundle_with_policy, StagedBundle};
-pub use transfer::{download, download_to_path, sha256_hex};
+pub use transfer::{download, download_to_path, sha256_file, sha256_hex};
 pub use verify::{
     verify_bundle, verify_bundle_with_policy, verify_signature, BundleVerification,
     BundleVerificationResult, VerificationPolicy,

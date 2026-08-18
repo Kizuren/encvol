@@ -10,6 +10,13 @@ fn command_line_has_installer_flag() -> bool {
         .any(|v| v == "encvol.installer=1")
 }
 
+pub(super) fn command_line_has_self_install_flag() -> bool {
+    fs::read_to_string("/proc/cmdline")
+        .unwrap_or_default()
+        .split_whitespace()
+        .any(|v| v == "encvol.self_install=1")
+}
+
 fn root_is_ram() -> bool {
     root_mount_is_ram(&fs::read_to_string("/proc/mounts").unwrap_or_default())
 }

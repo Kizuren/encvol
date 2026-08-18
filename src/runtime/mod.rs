@@ -8,6 +8,7 @@ mod config;
 mod environment;
 mod install;
 mod layout;
+mod self_install;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Firmware {
@@ -23,6 +24,7 @@ pub struct RuntimeOptions {
 }
 
 pub use install::run;
+pub use self_install::run as run_self_install;
 
 #[cfg(test)]
 use config::{prepare_target_runtime_directories, tang_config, write_root_configuration_at};

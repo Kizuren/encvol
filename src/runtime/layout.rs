@@ -2,7 +2,7 @@ use crate::{manifest::InstallationManifest, EncvolError};
 
 use super::Firmware;
 
-pub(super) fn partition(disk: &str, number: u8) -> String {
+pub(super) fn partition(disk: &str, number: u32) -> String {
     if disk.as_bytes().last().is_some_and(u8::is_ascii_digit) {
         format!("{disk}p{number}")
     } else {

@@ -36,12 +36,10 @@ pub struct HostCapabilities {
 }
 
 pub fn select_handoff(c: &HostCapabilities) -> Handoff {
-    if c.kexec {
-        Handoff::Kexec
+    if c.grub {
+        Handoff::GrubOnce
     } else if c.uefi && c.efi_variables && c.writable_esp.is_some() {
         Handoff::UefiBootnext
-    } else if c.grub {
-        Handoff::GrubOnce
     } else {
         Handoff::Unsupported
     }
@@ -127,7 +125,7 @@ pub fn handoff_commands(
             Command::new("systemctl", ["reboot"]),
         ]),
         Handoff::Unsupported => Err(EncvolError::Unsupported(
-            "neither kexec, UEFI BootNext, nor GRUB one-shot boot is usable".into(),
+            "neither GRUB one-shot boot nor UEFI BootNext is usable".into(),
         )),
     }
 }
@@ -199,8 +197,9 @@ fn boot_number(output: &str) -> Option<String> {
     })
 }
 
-fn installer_command_line() -> String {
+fn installer_command_line(extra_args: &[&str]) -> String {
     let mut args = vec!["encvol.installer=1".to_owned()];
+    args.extend(extra_args.iter().map(|arg| (*arg).to_owned()));
     if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
         for arg in cmdline.split_whitespace().filter(|arg| {
             arg.starts_with("console=")
@@ -238,6 +237,18 @@ pub fn execute_handoff(
     version: &str,
     esp: Option<&Path>,
 ) -> Result<(), EncvolError> {
+    execute_handoff_with_args(handoff, bundle, version, esp, &[])
+}
+
+/// Stage a verified bundle and select it for exactly one boot with extra
+/// encvol-specific kernel arguments.
+pub fn execute_handoff_with_args(
+    handoff: Handoff,
+    bundle: &StagedBundle,
+    version: &str,
+    esp: Option<&Path>,
+    extra_args: &[&str],
+) -> Result<(), EncvolError> {
     require_root()?;
     match handoff {
         Handoff::Kexec => {
@@ -257,7 +268,7 @@ pub fn execute_handoff(
                     kernel.to_str().unwrap_or_default(),
                     "--initrd",
                     initrd.to_str().unwrap_or_default(),
-                    &format!("--command-line={}", installer_command_line()),
+                    &format!("--command-line={}", installer_command_line(extra_args)),
                 ],
             )?;
             if qemu_direct_kexec_requested() {
@@ -291,6 +302,8 @@ pub fn execute_handoff(
                     "encvol-installer",
                     "--loader",
                     &format!("\\EFI\\encvol\\{version}\\installer.efi"),
+                    "--unicode",
+                    &installer_command_line(extra_args),
                 ],
             )?;
             let number = boot_number(&output).ok_or_else(|| {
@@ -319,7 +332,7 @@ pub fn execute_handoff(
                     EncvolError::Unsupported(format!("cannot preserve GRUB snippet: {e}"))
                 })?;
             }
-            fs::write(script, format!("#!/bin/sh\ncat <<'EOF'\nmenuentry 'encvol-installer' --id encvol-installer {{\n linux /boot/encvol/installer.kernel {}\n initrd /boot/encvol/installer.initrd\n}}\nEOF\n", installer_command_line())).map_err(|e| EncvolError::Unsupported(format!("cannot write GRUB installer entry: {e}")))?;
+            fs::write(script, format!("#!/bin/sh\ncat <<'EOF'\nmenuentry 'encvol-installer' --id encvol-installer {{\n linux /boot/encvol/installer.kernel {}\n initrd /boot/encvol/installer.initrd\n}}\nEOF\n", installer_command_line(extra_args))).map_err(|e| EncvolError::Unsupported(format!("cannot write GRUB installer entry: {e}")))?;
             checked("chmod", &["0755", "/etc/grub.d/42_encvol_installer"])?;
             checked("update-grub", &[])?;
             checked("grub-reboot", &["encvol-installer"])?;
@@ -344,12 +357,10 @@ mod tests {
             efi_variables: true,
             grub: true,
         };
-        assert_eq!(select_handoff(&c), Handoff::Kexec);
-        c.kexec = false;
-        assert_eq!(select_handoff(&c), Handoff::UefiBootnext);
-        c.efi_variables = false;
         assert_eq!(select_handoff(&c), Handoff::GrubOnce);
         c.grub = false;
+        assert_eq!(select_handoff(&c), Handoff::UefiBootnext);
+        c.efi_variables = false;
         assert_eq!(select_handoff(&c), Handoff::Unsupported);
     }
     #[test]
