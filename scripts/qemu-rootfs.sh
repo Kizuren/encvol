@@ -22,6 +22,7 @@ archive_url=
 root_password=
 user_password=
 password_ssh=0
+force_stop=0
 qemu_command=()
 release_set=0
 
@@ -30,6 +31,7 @@ usage() {
 usage:
   sudo scripts/qemu-rootfs.sh init [options]
   scripts/qemu-rootfs.sh start [options]
+  scripts/qemu-rootfs.sh stop [--force] [options]
   sudo scripts/qemu-rootfs.sh pack --archive-url URL [options]
   sudo scripts/qemu-rootfs.sh customize --archive-url URL [options]
 
@@ -47,6 +49,7 @@ options:
   --output PATH       Rootfs archive path for pack.
   --archive-url URL   HTTPS URL where the archive will be published.
   --format FORMAT     tar or tar.zst for pack. Default: tar.zst
+  --force             With stop, terminate the matching QEMU process.
 EOF
 }
 
@@ -65,6 +68,7 @@ while (($#)); do
         --output) output=${2:?missing output path}; shift 2 ;;
         --archive-url) archive_url=${2:?missing archive URL}; shift 2 ;;
         --format) format=${2:?missing format}; shift 2 ;;
+        --force) force_stop=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -74,6 +78,7 @@ disk="$workdir/rootfs.raw"
 kernel="$workdir/vmlinuz"
 initrd="$workdir/initrd.img"
 state_file="$workdir/rootfs.env"
+pidfile="$workdir/qemu.pid"
 
 load_state() {
     [[ -r $state_file ]] || return 0
@@ -380,6 +385,7 @@ qemu_args() {
         "${accel[@]}"
         -m "$memory"
         -smp "$cpus"
+        -pidfile "$pidfile"
         -drive "file=$disk,format=raw,if=virtio"
         -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
         -device virtio-net-pci,netdev=net0
@@ -403,6 +409,61 @@ run_qemu() {
 start_rootfs() {
     [[ -n $guest_user ]] || guest_user=encvol
     run_qemu
+}
+
+qemu_pids_for_disk() {
+    local pid cmdline
+    if [[ -r $pidfile ]]; then
+        pid=$(<"$pidfile")
+        if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]]; then
+            cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+            if [[ $cmdline == *qemu-system-x86_64* && $cmdline == *"$disk"* ]]; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+        fi
+    fi
+    for path in /proc/[0-9]*/cmdline; do
+        [[ -r $path ]] || continue
+        cmdline=$(tr '\0' ' ' < "$path")
+        [[ $cmdline == *qemu-system-x86_64* && $cmdline == *"$disk"* ]] || continue
+        pid=${path#/proc/}
+        printf '%s\n' "${pid%/cmdline}"
+    done
+}
+
+force_stop_qemu() {
+    local pids=()
+    mapfile -t pids < <(qemu_pids_for_disk | sort -u)
+    ((${#pids[@]} > 0)) || {
+        printf 'no QEMU process found for %s\n' "$disk" >&2
+        exit 1
+    }
+    kill "${pids[@]}"
+    printf 'terminated QEMU pid(s): %s\n' "${pids[*]}"
+    rm -f "$pidfile"
+}
+
+stop_rootfs() {
+    [[ -n $guest_user ]] || guest_user=encvol
+    if ((force_stop)); then
+        force_stop_qemu
+        return
+    fi
+    require_tools ssh
+    if ssh \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=accept-new \
+        -p "$ssh_port" \
+        "$guest_user@127.0.0.1" \
+        'sudo -n systemctl poweroff --no-wall >/dev/null 2>&1 &'
+    then
+        printf 'shutdown requested for QEMU rootfs at %s\n' "$workdir"
+        return
+    fi
+    printf '%s\n' 'clean shutdown over SSH failed; use stop --force only if the guest is stuck' >&2
+    exit 1
 }
 
 pack_rootfs() {
@@ -444,6 +505,7 @@ customize_rootfs() {
 case "$action" in
     init) init_rootfs ;;
     start) start_rootfs ;;
+    stop) stop_rootfs ;;
     pack) pack_rootfs ;;
     customize) customize_rootfs ;;
     --help|-h|'') usage ;;

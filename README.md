@@ -97,7 +97,7 @@ rootfs. SSH key login is always configured for root and the primary user.
 Shut the guest down cleanly when customization is done:
 
 ```sh
-sudo poweroff
+scripts/qemu-rootfs.sh stop
 ```
 
 Then pack the same guest filesystem as the rootfs artifact you will publish:
@@ -115,6 +115,13 @@ packs the rootfs automatically:
 sudo scripts/qemu-rootfs.sh customize \
   --archive-url https://images.example/encvol/trixie-root.tar.zst \
   --output /srv/encvol/publish/trixie-root.tar.zst
+```
+
+If the guest is stuck and SSH shutdown does not work, force-stop only the QEMU
+process using this rootfs disk:
+
+```sh
+scripts/qemu-rootfs-stop.sh --force
 ```
 
 Upload both `/srv/encvol/publish/trixie-root.tar.zst` and
