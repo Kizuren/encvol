@@ -166,6 +166,12 @@ PREREQ=''
 prereqs() { echo "$PREREQ"; }
 case "${1:-}" in prereqs) prereqs; exit 0;; esac
 . /usr/share/initramfs-tools/hook-functions
+copy_optional_file() {
+    [ ! -e "$1" ] || copy_file config "$1"
+}
+add_optional_module() {
+    manual_add_modules "$1" || true
+}
 copy_exec /usr/local/bin/encvol
 copy_exec /usr/bin/ip
 copy_exec /usr/sbin/wipefs
@@ -212,24 +218,24 @@ copy_exec /usr/bin/mkdir
 copy_exec /usr/bin/rm
 copy_exec /usr/bin/touch
 copy_exec /usr/bin/chmod
-copy_file config /etc/cracklib/cracklib.conf
-copy_file config /etc/security/pwquality.conf
+copy_optional_file /etc/cracklib/cracklib.conf
+copy_optional_file /etc/security/pwquality.conf
 copy_file config /etc/passwd
-copy_file config /var/cache/cracklib/cracklib_dict.hwm
-copy_file config /var/cache/cracklib/cracklib_dict.pwd
-copy_file config /var/cache/cracklib/cracklib_dict.pwi
+copy_optional_file /var/cache/cracklib/cracklib_dict.hwm
+copy_optional_file /var/cache/cracklib/cracklib_dict.pwd
+copy_optional_file /var/cache/cracklib/cracklib_dict.pwi
 [ ! -x /usr/bin/zstd ] || copy_exec /usr/bin/zstd
 copy_exec /usr/bin/systemd-ask-password
 copy_file config /etc/ssl/certs/ca-certificates.crt
-manual_add_modules dm-mod
-manual_add_modules dm-crypt
-manual_add_modules xts
-manual_add_modules aesni-intel || true
-manual_add_modules fat
-manual_add_modules vfat
-manual_add_modules nls_cp437
-manual_add_modules nls_ascii
-manual_add_modules nls_iso8859-1
+add_optional_module dm-mod
+add_optional_module dm-crypt
+add_optional_module xts
+add_optional_module aesni-intel
+add_optional_module fat
+add_optional_module vfat
+add_optional_module nls_cp437
+add_optional_module nls_ascii
+add_optional_module nls_iso8859-1
 EOF
 chmod 0755 "$installer_root/etc/initramfs-tools/hooks/encvol-qemu"
 cat > "$installer_root/etc/initramfs-tools/scripts/local-top/encvol-qemu" <<'EOF'
