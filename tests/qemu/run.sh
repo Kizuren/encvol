@@ -79,8 +79,9 @@ run_cargo() {
 
 require_qemu_host() {
     local missing=()
-    for tool in qemu-system-x86_64 qemu-img debootstrap mkfs.ext4 mount umount tar \
-                sha256sum openssl ssh-keygen gzip zstd cpio chroot ip flock python3 timeout jose; do
+    for tool in qemu-system-x86_64 qemu-img debootstrap mkfs.ext4 mkfs.xfs mount umount tar \
+                sha256sum openssl ssh-keygen gzip zstd cpio chroot ip flock python3 timeout jose \
+                losetup sgdisk partprobe partx; do
         command -v "$tool" >/dev/null || missing+=("$tool")
     done
     [[ -x /usr/libexec/tangd ]] || missing+=(/usr/libexec/tangd)

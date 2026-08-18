@@ -5,12 +5,12 @@ README.md is limited to usage commands.
 
 ## High-Level Flow
 
-1. Build or import a Debian-compatible amd64 root filesystem.
-2. Publish the rootfs archive and descriptor over HTTPS.
+1. Decide whether to capture the running root filesystem or use a prebuilt Debian-compatible amd64 rootfs descriptor.
+2. If using a prebuilt rootfs, publish the archive and descriptor over HTTPS.
 3. Run preflight against the target disk using a release `encvol` binary that contains its RAM installer.
 4. Run `install` without `--execute` to review the generated plan.
 5. Run `install --execute` to stage the embedded installer and perform a one-time boot handoff.
-6. The RAM installer revalidates safety conditions, downloads and verifies the rootfs archive, then replaces the selected disk.
+6. The RAM installer revalidates safety conditions, stages or downloads and verifies the rootfs archive, then replaces the selected disk.
 
 ## Rootfs Descriptor vs Installation Manifest
 
@@ -19,8 +19,9 @@ archive SHA-256, release, architecture, archive format, and required rootfs
 capabilities.
 
 The installation manifest is host-specific. `install` creates it locally by
-combining the descriptor with the selected disk, captured network configuration,
-Tang URL and thumbprint, recovery SSH key, and layout settings.
+combining either the live-root capture source or a descriptor with the selected
+disk, captured network configuration, Tang URL and thumbprint, recovery SSH
+key, and layout settings.
 
 Keeping these separate lets one rootfs artifact be reused across hosts without
 embedding target-specific secrets or disk choices in the artifact.
@@ -46,8 +47,10 @@ operation.
 ## Disk Safety Model
 
 The selected installation target must be a direct whole-disk `/dev/<disk>` path.
-Partitions, mapper devices, loop devices, aliases, symlinks, and mounted targets
-are refused.
+Partitions, mapper devices, loop devices, aliases, and symlinks are refused.
+Mounted non-root target disks are refused with the mounted source and target
+paths. The running root's parent disk is allowed only through the in-place
+staging flow.
 
 The same exact confirmation is required on the client and in the RAM installer:
 
@@ -76,7 +79,7 @@ The hidden `installer-run` command is the executable half of the installer. It
 requires the `encvol.installer=1` kernel command-line flag and a RAM-backed root
 unless an internal test bypass is used.
 
-The runtime path:
+The direct descriptor runtime path:
 
 1. validates the manifest and disk again
 2. confirms the target disk is not mounted
@@ -88,6 +91,12 @@ The runtime path:
 8. writes network, fstab, crypttab, GRUB, and recovery SSH configuration
 9. binds the LUKS slot to Tang using the pinned Tang thumbprint
 10. installs bootloader and regenerates initramfs
+
+The in-place runtime path first creates a temporary ext4 staging partition at
+the end of the selected disk. It uses existing end-of-disk free space when
+available; otherwise it shrinks only a final ext4 partition and never moves
+partitions. After the staged archive verifies, every non-staging partition on
+the selected disk is erased and replaced by the encrypted encvol layout.
 
 The LUKS recovery passphrase is supplied to commands through stdin. It is not
 placed in command arguments, environment variables, manifests, ESP files, or

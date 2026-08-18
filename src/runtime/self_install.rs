@@ -6,8 +6,11 @@ use crate::{
 };
 use std::{
     fs,
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 use url::Url;
 
@@ -25,6 +28,7 @@ use super::{
 
 const STAGING_MOUNT: &str = "/encvol-staging";
 const OLD_ROOT_MOUNT: &str = "/encvol-old-root";
+const GPT_TAIL_MARGIN_MIB: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct StagedRootfs {
@@ -46,6 +50,38 @@ fn checked_output(program: &str, args: &[&str]) -> Result<String, EncvolError> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn wait_for_block_device(path: &str) -> Result<(), EncvolError> {
+    for _ in 0..50 {
+        if fs::metadata(path)
+            .map(|metadata| metadata.file_type().is_block_device())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(EncvolError::Unsupported(format!(
+        "partition device did not appear: {path}"
+    )))
+}
+
+fn block_device_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+}
+
+fn partition_number_from_device(path: &str) -> Result<u32, EncvolError> {
+    let name = block_device_name(path);
+    let value = fs::read_to_string(format!("/sys/class/block/{name}/partition"))
+        .map_err(|_| EncvolError::UnsafeDisk("cannot identify partition number".into()))?;
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| EncvolError::UnsafeDisk("cannot identify partition number".into()))
 }
 
 fn parse_mib(value: &str) -> Option<u64> {
@@ -85,12 +121,13 @@ fn end_free_start_mib(disk: &str, required_mib: u64) -> Result<u64, EncvolError>
     }
     let start = parse_mib(&last[0]).unwrap_or(0);
     let size = parse_mib(&last[2]).unwrap_or(0);
-    if size < required_mib {
+    let usable_size = size.saturating_sub(GPT_TAIL_MARGIN_MIB);
+    if usable_size < required_mib {
         return Err(EncvolError::UnsafeDisk(format!(
-            "insufficient staging space: requires {required_mib} MiB, found {size} MiB"
+            "insufficient staging space: requires {required_mib} MiB, found {usable_size} MiB"
         )));
     }
-    Ok(start)
+    Ok(start + usable_size - required_mib)
 }
 
 fn partition_start_mib(disk: &str, partn: u32) -> Result<u64, EncvolError> {
@@ -108,40 +145,56 @@ fn partition_start_mib(disk: &str, partn: u32) -> Result<u64, EncvolError> {
     ))
 }
 
+fn update_partition_nodes(disk: &str, range: &str) -> Result<(), EncvolError> {
+    run_command(
+        &[
+            "partx".into(),
+            "--update".into(),
+            "--nr".into(),
+            range.into(),
+            disk.into(),
+        ],
+        None,
+    )
+}
+
 fn existing_partition_numbers(disk: &str) -> Result<Vec<u32>, EncvolError> {
-    let output = checked_output("lsblk", &["-nr", "-o", "PARTN", disk])?;
+    let output = checked_output("lsblk", &["-nr", "-o", "NAME,TYPE", disk])?;
     Ok(output
         .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            (fields.next() == Some("part")).then(|| {
+                fs::read_to_string(format!("/sys/class/block/{name}/partition"))
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+            })?
+        })
         .collect())
 }
 
 fn verify_original_root(manifest: &SelfInstallManifest) -> Result<(), EncvolError> {
-    let output = checked_output(
-        "lsblk",
-        &[
-            "-n",
-            "-o",
-            "PARTN,UUID,FSTYPE",
-            &manifest.original_root.path,
-        ],
+    let partn = partition_number_from_device(&manifest.original_root.path)?;
+    let uuid = checked_output(
+        "blkid",
+        &["-s", "UUID", "-o", "value", &manifest.original_root.path],
+    )
+    .ok()
+    .map(|value| value.trim().to_owned())
+    .filter(|value| !value.is_empty());
+    let fstype = checked_output(
+        "blkid",
+        &["-s", "TYPE", "-o", "value", &manifest.original_root.path],
     )?;
-    let fields: Vec<_> = output.split_whitespace().collect();
-    if fields.len() < 3 {
-        return Err(EncvolError::UnsafeDisk(
-            "cannot revalidate original root partition".into(),
-        ));
-    }
-    let partn = fields[0]
-        .parse::<u32>()
-        .map_err(|_| EncvolError::UnsafeDisk("cannot revalidate root partition number".into()))?;
+    let fstype = fstype.trim();
     if partn != manifest.original_root.partition_number
         || manifest
             .original_root
             .uuid
             .as_deref()
-            .is_some_and(|uuid| uuid != fields[1])
-        || manifest.original_root.fstype != fields[2]
+            .is_some_and(|expected| Some(expected) != uuid.as_deref())
+        || manifest.original_root.fstype != fstype
     {
         return Err(EncvolError::UnsafeDisk(
             "original root partition identity changed since staging".into(),
@@ -167,43 +220,58 @@ fn create_staging_partition(manifest: &SelfInstallManifest) -> Result<u32, Encvo
         StagingStrategy::ShrinkExt4 {
             root_target_size_mib,
             root_partition_end_mib,
+            shrink_partition,
             ..
         } => {
-            if manifest.original_root.fstype != "ext4" {
+            let shrink_path = shrink_partition
+                .as_ref()
+                .map(|partition| partition.path.as_str())
+                .unwrap_or(manifest.original_root.path.as_str());
+            let shrink_partition_number = shrink_partition
+                .as_ref()
+                .map(|partition| partition.partition_number)
+                .unwrap_or(manifest.original_root.partition_number);
+            let shrink_fstype = shrink_partition
+                .as_ref()
+                .map(|partition| partition.fstype.as_str())
+                .unwrap_or(manifest.original_root.fstype.as_str());
+            if shrink_fstype != "ext4" {
                 return Err(EncvolError::UnsafeDisk(
-                    "only ext4 roots can be shrunk for self-install staging".into(),
+                    "only ext4 partitions can be shrunk for in-place staging".into(),
                 ));
             }
+            let shrink_partition_start_mib =
+                partition_start_mib(&manifest.target_disk, shrink_partition_number)?;
             run_command(
                 &[
                     "e2fsck".into(),
                     "-f".into(),
-                    manifest.original_root.path.clone(),
+                    "-y".into(),
+                    shrink_path.into(),
                 ],
                 None,
             )?;
             run_command(
                 &[
                     "resize2fs".into(),
-                    manifest.original_root.path.clone(),
+                    shrink_path.into(),
                     format!("{root_target_size_mib}M"),
                 ],
                 None,
             )?;
             run_command(
                 &[
-                    "parted".into(),
-                    "-s".into(),
+                    "sgdisk".into(),
+                    format!("--delete={shrink_partition_number}"),
+                    format!(
+                        "--new={shrink_partition_number}:{shrink_partition_start_mib}MiB:{root_partition_end_mib}MiB"
+                    ),
+                    format!("--typecode={shrink_partition_number}:8300"),
                     manifest.target_disk.clone(),
-                    "unit".into(),
-                    "MiB".into(),
-                    "resizepart".into(),
-                    manifest.original_root.partition_number.to_string(),
-                    root_partition_end_mib.to_string(),
                 ],
                 None,
             )?;
-            run_command(&["partprobe".into(), manifest.target_disk.clone()], None)?;
+            update_partition_nodes(&manifest.target_disk, &shrink_partition_number.to_string())?;
         }
     }
     let start_mib = end_free_start_mib(&manifest.target_disk, staging_size_mib)?;
@@ -218,6 +286,7 @@ fn create_staging_partition(manifest: &SelfInstallManifest) -> Result<u32, Encvo
     )?;
     run_command(&["partprobe".into(), manifest.target_disk.clone()], None)?;
     let staging_partition = partition(&manifest.target_disk, staging_partition_number);
+    wait_for_block_device(&staging_partition)?;
     run_command(
         &["mkfs.ext4".into(), "-F".into(), staging_partition.clone()],
         None,
@@ -342,8 +411,9 @@ fn create_preserved_layout(
         manifest.target_disk.clone(),
     ]);
     run_command(&partition_command, None)?;
-    run_command(&["partprobe".into(), manifest.target_disk.clone()], None)?;
+    update_partition_nodes(&manifest.target_disk, "1:2")?;
     let crypt = partition(&manifest.target_disk, 2);
+    wait_for_block_device(&crypt)?;
     for command in [
         vec![
             "wipefs".into(),
@@ -519,7 +589,10 @@ fn remove_staging_and_grow(disk: &str, staging_partition_number: u32) -> Result<
         ],
         None,
     )?;
-    run_command(&["partprobe".into(), disk.into()], None)?;
+    if let Err(error) = update_partition_nodes(disk, "2") {
+        eprintln!("encvol: root grow deferred until reboot: {error}");
+        return Ok(());
+    }
     run_command(
         &["cryptsetup".into(), "resize".into(), "encvol_crypt".into()],
         None,

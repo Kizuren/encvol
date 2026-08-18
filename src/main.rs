@@ -30,7 +30,6 @@ struct Cli {
 enum Top {
     Preflight(PreflightArgs),
     Install(InstallArgs),
-    SelfInstall(SelfInstallArgs),
     Rootfs {
         #[command(subcommand)]
         command: RootfsCommand,
@@ -49,33 +48,9 @@ struct PreflightArgs {
 struct InstallArgs {
     #[arg(long)]
     disk: String,
-    #[arg(long)]
-    rootfs_descriptor: Url,
-    #[arg(long)]
-    tang_url: Url,
-    #[arg(long)]
-    tang_thumbprint: String,
-    #[arg(long)]
-    recovery_authorized_key: PathBuf,
-    #[arg(long, default_value_t = 1024)]
-    swap_mib: u64,
-    #[arg(long)]
-    data_volume: bool,
-    /// Exact acknowledgement: WIPE:/dev/the-selected-disk
-    #[arg(long)]
-    confirm: Option<String>,
-    /// Stage the verified installer and reboot through the selected handoff.
-    #[arg(long)]
-    execute: bool,
-}
-#[derive(Args)]
-struct SelfInstallArgs {
-    #[arg(long)]
-    disk: String,
+    /// HTTPS rootfs descriptor to install instead of capturing the running root.
     #[arg(long)]
     rootfs_descriptor: Option<Url>,
-    #[arg(long)]
-    use_live_root: bool,
     #[arg(long)]
     tang_url: Url,
     #[arg(long)]
@@ -152,7 +127,6 @@ fn main() -> Result<()> {
             }
         }
         Top::Install(args) => install(args)?,
-        Top::SelfInstall(args) => self_install_command(args)?,
         Top::Rootfs { command } => rootfs_command(command)?,
         Top::InstallerRun(args) => installer_run(args)?,
     }
@@ -172,15 +146,27 @@ fn embedded_bundle_for_execute(execute: bool) -> Result<Option<&'static [u8]>> {
 }
 
 fn install(args: InstallArgs) -> Result<()> {
+    let in_place = if args.rootfs_descriptor.is_none() {
+        true
+    } else {
+        self_install::is_running_root_parent(&args.disk).unwrap_or(false)
+    };
+    if in_place {
+        return in_place_install_command(args);
+    }
     let embedded_bundle = embedded_bundle_for_execute(args.execute)?;
     safety::validate_disk_path(&args.disk).map_err(anyhow::Error::msg)?;
     safety::require_confirmation(&args.disk, args.confirm.as_deref())
         .map_err(anyhow::Error::msg)?;
-    let report = preflight::probe(&args.disk).map_err(anyhow::Error::msg)?;
+    let report = preflight::probe_external_descriptor(&args.disk).map_err(anyhow::Error::msg)?;
     if report.handoff == encvol::handoff::Handoff::Unsupported {
         bail!("preflight rejected this host; no changes were made")
     }
-    let bytes = bundle::download(&args.rootfs_descriptor).map_err(anyhow::Error::msg)?;
+    let rootfs_descriptor = args
+        .rootfs_descriptor
+        .as_ref()
+        .expect("checked above for direct descriptor install");
+    let bytes = bundle::download(rootfs_descriptor).map_err(anyhow::Error::msg)?;
     let rootfs: RootfsDescriptor =
         serde_json::from_slice(&bytes).context("rootfs descriptor is not valid JSON")?;
     rootfs.validate().map_err(anyhow::Error::msg)?;
@@ -232,7 +218,7 @@ fn install(args: InstallArgs) -> Result<()> {
     Ok(())
 }
 
-fn self_install_command(args: SelfInstallArgs) -> Result<()> {
+fn in_place_install_command(args: InstallArgs) -> Result<()> {
     let embedded_bundle = embedded_bundle_for_execute(args.execute)?;
     safety::require_confirmation(&args.disk, args.confirm.as_deref())
         .map_err(anyhow::Error::msg)?;
@@ -243,7 +229,6 @@ fn self_install_command(args: SelfInstallArgs) -> Result<()> {
     let (manifest, plan, capabilities) = self_install::prepare(self_install::SelfInstallRequest {
         disk: args.disk,
         rootfs_descriptor: args.rootfs_descriptor,
-        use_live_root: args.use_live_root,
         tang_url: args.tang_url,
         tang_thumbprint: args.tang_thumbprint,
         recovery_authorized_key,

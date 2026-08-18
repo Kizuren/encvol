@@ -51,6 +51,13 @@ pub struct RootPartitionIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShrinkPartitionIdentity {
+    pub path: String,
+    pub partition_number: u32,
+    pub fstype: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum StagingStrategy {
     ExistingFree {
@@ -62,6 +69,8 @@ pub enum StagingStrategy {
         root_target_size_mib: u64,
         root_partition_end_mib: u64,
         staging_size_mib: u64,
+        #[serde(default)]
+        shrink_partition: Option<ShrinkPartitionIdentity>,
     },
 }
 
@@ -134,10 +143,6 @@ impl SelfInstallManifest {
         }
         safety::validate_disk_path(&self.target_disk)?;
         if self.original_root.path == self.target_disk
-            || !safety::is_mounted_source(
-                &self.target_disk,
-                std::slice::from_ref(&self.original_root.path),
-            )
             || self.original_root.partition_number == 0
             || self.original_root.fstype.trim().is_empty()
         {
@@ -170,6 +175,21 @@ impl SelfInstallManifest {
                         "staging partition number and size are required".into(),
                     ));
                 }
+            }
+        }
+        if let StagingStrategy::ShrinkExt4 {
+            shrink_partition: Some(shrink),
+            ..
+        } = &self.staging
+        {
+            if shrink.path == self.target_disk
+                || !safety::is_mounted_source(&self.target_disk, std::slice::from_ref(&shrink.path))
+                || shrink.partition_number == 0
+                || shrink.fstype != "ext4"
+            {
+                return Err(EncvolError::Manifest(
+                    "shrink partition identity is invalid".into(),
+                ));
             }
         }
         if (self.tang_url.scheme() != "https" && self.tang_url.scheme() != "http")
@@ -282,6 +302,7 @@ mod tests {
                 root_target_size_mib: 4096,
                 root_partition_end_mib: 4097,
                 staging_size_mib: 2048,
+                shrink_partition: None,
             },
             tang_url: base.tang_url,
             tang_thumbprint: base.tang_thumbprint,
@@ -326,9 +347,16 @@ mod tests {
                 uuid: None,
                 fstype: "ext4".into(),
             },
-            staging: StagingStrategy::ExistingFree {
+            staging: StagingStrategy::ShrinkExt4 {
                 staging_partition_number: 3,
                 staging_size_mib: 2048,
+                root_target_size_mib: 4096,
+                root_partition_end_mib: 4097,
+                shrink_partition: Some(ShrinkPartitionIdentity {
+                    path: "/dev/vdaa1".into(),
+                    partition_number: 1,
+                    fstype: "ext4".into(),
+                }),
             },
             tang_url: base.tang_url,
             tang_thumbprint: base.tang_thumbprint,

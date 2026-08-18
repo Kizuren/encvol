@@ -20,7 +20,7 @@ jobs:
           sudo apt-get install -y \
             qemu-system-x86 qemu-utils debootstrap debian-archive-keyring \
             tang jose ovmf zstd cpio dosfstools gdisk kexec-tools \
-            iproute2 openssl openssh-client util-linux e2fsprogs tar gzip python3
+            parted xfsprogs iproute2 openssl openssh-client util-linux e2fsprogs tar gzip python3
           if [ ! -x /usr/libexec/tangd ] && [ -x /usr/lib/x86_64-linux-gnu/tangd ]; then
             sudo mkdir -p /usr/libexec
             sudo ln -s /usr/lib/x86_64-linux-gnu/tangd /usr/libexec/tangd

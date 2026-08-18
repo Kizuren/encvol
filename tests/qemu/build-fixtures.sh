@@ -32,8 +32,8 @@ version=0.0.0-qemu
 gateway=${ENCVOL_QEMU_GATEWAY:-192.168.231.1}
 guest=${ENCVOL_QEMU_GUEST_IP:-192.168.231.2}
 
-for tool in qemu-img debootstrap mkfs.ext4 mount umount tar sha256sum openssl ssh-keygen \
-            gzip zstd cpio chroot jose; do
+for tool in qemu-img debootstrap mkfs.ext4 mkfs.xfs mount umount tar sha256sum openssl ssh-keygen \
+            gzip zstd cpio chroot jose losetup sgdisk partprobe partx; do
     command -v "$tool" >/dev/null || { printf 'missing fixture prerequisite: %s\n' "$tool" >&2; exit 77; }
 done
 [[ -x /usr/libexec/tangd && -x /usr/libexec/tangd-keygen ]] || {
@@ -93,13 +93,15 @@ openssl x509 -req -days 1 \
     -out "$artifacts/certs/server.crt" -copy_extensions copyall >/dev/null 2>&1
 chmod 0600 "$artifacts/certs/ca.key" "$artifacts/certs/server.key"
 
-packages='systemd-sysv,linux-image-amd64,iproute2,kexec-tools,cryptsetup,lvm2,gdisk,dosfstools,ca-certificates,apt,openssh-server,dropbear-initramfs,clevis,clevis-luks,clevis-initramfs,grub-pc,grub-efi-amd64,shim-signed,initramfs-tools,dpkg-dev,zstd'
+packages='systemd-sysv,linux-image-amd64,iproute2,kexec-tools,cryptsetup,lvm2,gdisk,parted,dosfstools,xfsprogs,ca-certificates,apt,openssh-server,dropbear-initramfs,clevis,clevis-luks,clevis-initramfs,grub-pc,grub-efi-amd64,shim-signed,initramfs-tools,dpkg-dev,zstd'
 
 rootfs_root="$artifacts/rootfs-root"
 source_root="$artifacts/source-root"
 mount_root=0
+source_loop=
 cleanup_mount() {
     if ((mount_root)); then umount "$source_root" 2>/dev/null || true; fi
+    if [[ -n ${source_loop:-} ]]; then losetup -d "$source_loop" 2>/dev/null || true; fi
 }
 trap cleanup_mount EXIT
 
@@ -142,13 +144,21 @@ ln -sf /lib/systemd/system/systemd-networkd.service "$rootfs_root/etc/systemd/sy
 ln -sf /lib/systemd/system/ssh.service "$rootfs_root/etc/systemd/system/multi-user.target.wants/ssh.service" || true
 rm -f "$rootfs_root/etc/ssh/ssh_host_"*key*
 
-# Source disk is a separate raw ext4 image: vda is never handed to the
-# installer and vdb is always a fresh qcow2 target.  The old paths are kept as
-# a stable fixture contract for individual case scripts.
+# Source disk is a partitioned raw image whose root is /dev/vda1.  The live-root
+# installer planner requires a real parent disk plus root partition, while the
+# old artifact paths remain stable for individual case scripts.
 source_raw="$artifacts/disks/source.raw"
-qemu-img create -f raw "$source_raw" 5G >/dev/null
-mkfs.ext4 -q -F "$source_raw"
-mount -o loop "$source_raw" "$source_root"
+qemu-img create -f raw "$source_raw" 18G >/dev/null
+sgdisk --clear --new=1:1MiB:+8GiB --typecode=1:8300 "$source_raw" >/dev/null
+source_loop=$(losetup --find --show --partscan "$source_raw")
+source_partition="${source_loop}p1"
+for _ in $(seq 1 50); do
+    [[ -b $source_partition ]] && break
+    sleep 0.1
+done
+[[ -b $source_partition ]] || { printf 'missing source root partition: %s\n' "$source_partition" >&2; exit 1; }
+mkfs.ext4 -q -F "$source_partition"
+mount "$source_partition" "$source_root"
 mount_root=1
 tar --numeric-owner -C "$rootfs_root" -cf - . | tar --numeric-owner -C "$source_root" -xf -
 install -D -m 0755 "$artifacts/qemu/bootstrap-encvol" "$source_root/usr/local/bin/encvol"
@@ -192,13 +202,21 @@ add_optional_module() {
 }
 copy_file_once binary /usr/local/bin/encvol
 copy_exec_once /usr/bin/ip
+copy_exec_once /usr/sbin/blkid
 copy_exec_once /usr/sbin/wipefs
 copy_exec_once /usr/sbin/sgdisk
+copy_exec_once /usr/sbin/parted
+copy_exec_once /usr/sbin/partprobe
+copy_exec_once /usr/bin/partx
 copy_exec_once /usr/sbin/cryptsetup
 copy_exec_once /usr/sbin/modprobe
 copy_exec_once /usr/sbin/pvcreate
 copy_exec_once /usr/sbin/vgcreate
 copy_exec_once /usr/sbin/lvcreate
+copy_exec_once /usr/sbin/lvextend
+copy_exec_once /usr/sbin/pvresize
+copy_exec_once /usr/bin/lsblk
+copy_exec_once /usr/bin/findmnt
 # BusyBox's initramfs hook may install applet hardlinks before this hook runs.
 # Replace them with the real e2fsprogs/util-linux binaries: the installer
 # requires ext4 support, while BusyBox provides mke2fs but not the mkfs.ext4
@@ -207,6 +225,8 @@ rm -f "${DESTDIR}/usr/sbin/mke2fs" "${DESTDIR}/usr/sbin/mkfs.ext4" "${DESTDIR}/u
 copy_exec_once /usr/sbin/mke2fs /usr/sbin/mke2fs
 ln -s mke2fs "${DESTDIR}/usr/sbin/mkfs.ext4"
 copy_exec_once /usr/sbin/mkswap /usr/sbin/mkswap
+copy_exec_once /usr/sbin/e2fsck /usr/sbin/e2fsck
+copy_exec_once /usr/sbin/resize2fs /usr/sbin/resize2fs
 # dosfstools' mkfs.fat has no additional runtime dependency in some Debian
 # builds and `copy_exec` reports that as a non-zero optional-library result
 # after it has copied the executable. Keep the copied binary and continue.
@@ -275,7 +295,9 @@ done)
 ip link set "$iface" up
 ip addr add 192.168.231.2/24 dev "$iface" 2>/dev/null || true
 ip route replace default via 192.168.231.1 dev "$iface"
-export ENCVOL_CONFIRM=WIPE:/dev/vdb
+target_disk=$(sed -n 's/.*"target_disk"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/encvol/manifest.json | head -n 1)
+[ -n "$target_disk" ] || { echo 'encvol: installer manifest lacks target disk'; poweroff -f; }
+export ENCVOL_CONFIRM="WIPE:${target_disk}"
 export ENCVOL_QEMU_RECOVERY_PASSPHRASE=encvol-qemu-recovery-passphrase
 firmware=bios
 case "$(cat /proc/cmdline 2>/dev/null)" in *encvol.qemu_firmware=uefi*) firmware=uefi;; esac
@@ -371,6 +393,8 @@ for arg in $(cat /proc/cmdline 2>/dev/null); do
 done
 rootfs_descriptor=bookworm-root.tar.json
 data_args=
+install_disk=/dev/vdb
+descriptor_args=
 case "$case_name" in
   *tarzst-root-swap-data)
     rootfs_descriptor=bookworm-root.tar.zst.json
@@ -382,18 +406,96 @@ case "$case_name" in
     echo 'encvol: qemu rootfs format tar'
     ;;
 esac
+
+wait_block() {
+  path=$1
+  count=0
+  while { [ ! -b "$path" ] || ! lsblk -n "$path" >/dev/null 2>&1; } && [ "$count" -lt 50 ]; do
+    sleep 0.1
+    count=$((count + 1))
+  done
+  [ -b "$path" ] && lsblk -n "$path" >/dev/null 2>&1
+}
+
+wait_fstype() {
+  path=$1
+  fstype=$2
+  count=0
+  while [ "$(blkid -s TYPE -o value "$path" 2>/dev/null || true)" != "$fstype" ] && [ "$count" -lt 50 ]; do
+    sleep 0.1
+    count=$((count + 1))
+  done
+  [ "$(blkid -s TYPE -o value "$path" 2>/dev/null || true)" = "$fstype" ]
+}
+
+reset_target_gpt() {
+  wipefs --all --force /dev/vdb >/dev/null 2>&1 || true
+  sgdisk --zap-all /dev/vdb >/dev/null 2>&1 || true
+  sgdisk --clear /dev/vdb >/dev/null
+  partprobe /dev/vdb >/dev/null 2>&1 || true
+}
+
+case "$case_name" in
+  *live-root*)
+    descriptor_args=
+    echo 'encvol: qemu live-root source enabled'
+    ;;
+  *)
+    descriptor_args="--rootfs-descriptor https://192.168.231.1/rootfs/${rootfs_descriptor}"
+    ;;
+esac
+
+case "$case_name" in
+  *live-root-rootdisk-free)
+    install_disk=/dev/vda
+    ;;
+  *live-root-secondary-free)
+    install_disk=/dev/vdb
+    reset_target_gpt
+    ;;
+  *live-root-secondary-shrink-ext4)
+    install_disk=/dev/vdb
+    reset_target_gpt
+    sgdisk --new=1:1MiB:0 --typecode=1:8300 /dev/vdb >/dev/null
+    partprobe /dev/vdb >/dev/null 2>&1 || true
+    wait_block /dev/vdb1
+    mkfs.ext4 -q -F /dev/vdb1
+    wait_fstype /dev/vdb1 ext4
+    ;;
+  *live-root-mounted-target-refusal)
+    install_disk=/dev/vdb
+    reset_target_gpt
+    sgdisk --new=1:1MiB:+512MiB --typecode=1:8300 /dev/vdb >/dev/null
+    partprobe /dev/vdb >/dev/null 2>&1 || true
+    wait_block /dev/vdb1
+    mkfs.ext4 -q -F /dev/vdb1
+    wait_fstype /dev/vdb1 ext4
+    mkdir -p /mnt/encvol-mounted-target
+    mount /dev/vdb1 /mnt/encvol-mounted-target
+    ;;
+  *live-root-secondary-final-xfs-refusal)
+    install_disk=/dev/vdb
+    reset_target_gpt
+    sgdisk --new=1:1MiB:0 --typecode=1:8300 /dev/vdb >/dev/null
+    partprobe /dev/vdb >/dev/null 2>&1 || true
+    wait_block /dev/vdb1
+    mkfs.xfs -f /dev/vdb1 >/dev/null
+    wait_fstype /dev/vdb1 xfs
+    ;;
+esac
+
 echo 'encvol: invoking normal client install path'
 export ENCVOL_QEMU_DIRECT_KEXEC=1
 set +e
 /usr/local/bin/encvol install \
-  --disk /dev/vdb \
-  --rootfs-descriptor "https://192.168.231.1/rootfs/${rootfs_descriptor}" \
+  --disk "$install_disk" \
+  ${descriptor_args} \
   --tang-url http://192.168.231.1:8080 \
   --tang-thumbprint "$thumbprint" \
   --recovery-authorized-key /root/encvol-recovery.pub \
   --swap-mib 1024 \
   ${data_args} \
-  --confirm WIPE:/dev/vdb \
+  --confirm "WIPE:${install_disk}" \
   --execute
 status=$?
 echo "encvol: source client exited ${status}"
@@ -456,7 +558,46 @@ cat > "$artifacts/fixtures.json" <<EOF
 {"suite":"${suite}","case":${case_json},"source_disk":"disks/source.raw","target_disk":"disks/target.qcow2","installer_kernel":"qemu/installer.kernel","installer_initrd":"qemu/installer.initrd","https_root":"services/https","rootfs_formats":["tar","tar.zst"],"local_apt":"rootfs-root/opt/encvol-apt","tang_thumbprint":"${thumbprint}"}
 EOF
 
+write_expect() {
+    local name=$1
+    shift
+    {
+        while (($#)); do printf '%s\n' "$1"; shift; done
+    } > "$artifacts/qemu/case-$name.expect"
+}
+for name in bios-live-root-rootdisk-free uefi-live-root-rootdisk-free; do
+    write_expect "$name" \
+        'expected_disk=unchanged' \
+        'expected_source_disk=changed' \
+        'serial_contains=encvol: qemu live-root source enabled'
+done
+for name in bios-live-root-secondary-free uefi-live-root-secondary-free bios-live-root-secondary-shrink-ext4; do
+    write_expect "$name" \
+        'expected_disk=changed' \
+        'serial_contains=encvol: qemu live-root source enabled'
+done
+write_expect bios-live-root-mounted-target-refusal \
+    'expected_disk=changed' \
+    'serial_contains=encvol: source client exited ' \
+    'serial_contains=target disk has mounted partitions' \
+    'serial_contains=umount <mount-target>'
+write_expect bios-live-root-secondary-final-xfs-refusal \
+    'expected_disk=changed' \
+    'serial_contains=encvol: source client exited ' \
+    'serial_contains=final target partition is xfs'
+for name in bios-live-root-mounted-target-refusal bios-live-root-secondary-final-xfs-refusal; do
+    install -D -m 0755 /dev/stdin "$artifacts/guest/assert-$name.sh" <<'EOF'
+#!/bin/sh
+set -eu
+serial="${ENCVOL_QEMU_CASE_DIR}/serial/console.log"
+grep -Eq 'source client exited [1-9][0-9]*' "$serial"
+! grep -F -q 'encvol: installer-run exited 0' "$serial"
+EOF
+done
+
 umount "$source_root"
 mount_root=0
+losetup -d "$source_loop"
+source_loop=
 rmdir "$source_root"
 printf '%s\n' "$suite" > "$artifacts/fixture-suite"

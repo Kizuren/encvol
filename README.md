@@ -151,7 +151,7 @@ descriptor before running `encvol install` on the VPS.
 Inspect the target host before installation:
 
 ```sh
-sudo encvol preflight --disk /dev/vdb --pretty
+sudo encvol preflight --disk /dev/sda --pretty
 ```
 
 Stop if preflight reports an unsupported handoff or missing network capture.
@@ -159,17 +159,18 @@ Stop if preflight reports an unsupported handoff or missing network capture.
 ## Plan Install
 
 Without `--execute`, `install` prints the installation plan and does not stage
-or reboot into the embedded installer:
+or reboot into the embedded installer. By default it captures the running root
+filesystem, stages that archive on the selected disk, and then installs encvol
+onto that same disk:
 
 ```sh
 sudo encvol install \
-  --disk /dev/vdb \
-  --rootfs-descriptor https://images.example/encvol/trixie-root.tar.json \
+  --disk /dev/sda \
   --tang-url https://tang.example \
   --tang-thumbprint 'PINNED_TANG_THUMBPRINT' \
   --recovery-authorized-key ./recovery.pub \
   --swap-mib 1024 \
-  --confirm WIPE:/dev/vdb
+  --confirm WIPE:/dev/sda
 ```
 
 Add `--data-volume` to allocate remaining free LVM extents to a separate data
@@ -183,13 +184,25 @@ disk-changing path:
 
 ```sh
 sudo encvol install \
+  --disk /dev/sda \
+  --tang-url https://tang.example \
+  --tang-thumbprint 'PINNED_TANG_THUMBPRINT' \
+  --recovery-authorized-key ./recovery.pub \
+  --confirm WIPE:/dev/sda \
+  --execute
+```
+
+To install from a prebuilt HTTPS rootfs descriptor instead of capturing the
+running root, pass `--rootfs-descriptor`:
+
+```sh
+sudo encvol install \
   --disk /dev/vdb \
   --rootfs-descriptor https://images.example/encvol/trixie-root.tar.json \
   --tang-url https://tang.example \
   --tang-thumbprint 'PINNED_TANG_THUMBPRINT' \
   --recovery-authorized-key ./recovery.pub \
-  --confirm WIPE:/dev/vdb \
-  --execute
+  --confirm WIPE:/dev/vdb
 ```
 
 The installed system unlocks automatically through Clevis/Tang using the pinned

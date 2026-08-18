@@ -22,17 +22,18 @@ work; use the timeout variable for slower hosts.
 ## Prerequisites
 
 The host needs KVM (`/dev/kvm`), QEMU, OVMF for UEFI recipes, `debootstrap`,
-`qemu-img`, `iproute2`, `openssl`, `zstd`, `cpio`, `jose`, Tang's
-`tangd`/`tangd-keygen` utilities, and a Debian mirror while fixtures are being
-built.  Guests have no development-LAN or user-mode NIC, and do not contact
-Debian after the builder completes.
+`qemu-img`, `iproute2`, `openssl`, `zstd`, `cpio`, `jose`, `losetup`, GPT and
+partition tools, `xfsprogs`, Tang's `tangd`/`tangd-keygen` utilities, and a
+Debian mirror while fixtures are being built. Guests have no development-LAN or
+user-mode NIC, and do not contact Debian after the builder completes.
 
 ## Fixture contract
 
 `build-fixtures.sh` is intentionally reusable by individual case scripts. It
 always creates these paths:
 
-- `disks/source.raw` — a disposable Debian source system (vda).
+- `disks/source.raw` — a partitioned disposable Debian source system whose root
+  filesystem is `vda1`.
 - `disks/target.qcow2` — the only guest-writable installation target (vdb).
 - `qemu/source.kernel` and `qemu/source.initrd` — source-system boot inputs.
 - `qemu/installer.kernel` and `qemu/installer.initrd` — RAM-installer boot

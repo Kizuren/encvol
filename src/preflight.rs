@@ -1,7 +1,10 @@
 use crate::{
     handoff::{select_handoff, Handoff, HostCapabilities},
+    manifest::StagingStrategy,
     network::{NetworkConfig, NetworkMode},
-    safety, EncvolError,
+    safety,
+    self_install::{self, InstallMode, MountedPartition},
+    EncvolError,
 };
 use serde::Serialize;
 use std::{
@@ -14,6 +17,9 @@ use std::{
 #[derive(Debug, Serialize)]
 pub struct PreflightReport {
     pub target_disk: String,
+    pub install_mode: InstallMode,
+    pub staging: Option<StagingStrategy>,
+    pub mounted: Vec<MountedPartition>,
     pub handoff: Handoff,
     pub capabilities: HostCapabilities,
     pub network: Option<NetworkConfig>,
@@ -100,20 +106,24 @@ fn host_network() -> Option<NetworkConfig> {
         dns: dns(),
     })
 }
-pub fn probe(disk: &str) -> Result<PreflightReport, EncvolError> {
-    safety::validate_disk_path(disk)?;
-    let metadata =
-        fs::metadata(disk).map_err(|_| EncvolError::UnsafeDisk("target does not exist".into()))?;
-    if !metadata.file_type().is_block_device() {
-        return Err(EncvolError::UnsafeDisk(
-            "target is not a block device".into(),
-        ));
-    }
-    if safety::is_mounted_source(disk, &mounted_sources()) {
-        return Err(EncvolError::UnsafeDisk(
-            "target or one of its partitions is mounted".into(),
-        ));
-    }
+
+fn qemu_direct_kexec_requested() -> bool {
+    std::env::var_os("ENCVOL_QEMU_DIRECT_KEXEC").is_some()
+        && fs::read_to_string("/proc/cmdline")
+            .map(|cmdline| {
+                cmdline
+                    .split_whitespace()
+                    .any(|arg| arg == "encvol.qemu.source=1")
+            })
+            .unwrap_or(false)
+}
+
+fn base_report(
+    disk: &str,
+    install_mode: InstallMode,
+    staging: Option<StagingStrategy>,
+    mounted: Vec<MountedPartition>,
+) -> PreflightReport {
     let uefi = Path::new("/sys/firmware/efi").is_dir();
     let cap = HostCapabilities {
         kexec: program_exists("kexec") && kexec_load_enabled(),
@@ -122,21 +132,78 @@ pub fn probe(disk: &str) -> Result<PreflightReport, EncvolError> {
         efi_variables: Path::new("/sys/firmware/efi/efivars").is_dir(),
         grub: program_exists("grub-reboot") && Path::new("/boot/grub/grub.cfg").is_file(),
     };
-    let handoff = select_handoff(&cap);
+    let handoff = if qemu_direct_kexec_requested() && cap.kexec {
+        Handoff::Kexec
+    } else {
+        select_handoff(&cap)
+    };
     let mut warnings = Vec::new();
     if handoff == Handoff::Unsupported {
         warnings.push("no safe installer handoff is available; no writes will be made".into());
     }
-    if host_network().is_none() {
+    let network = host_network();
+    if network.is_none() {
         warnings.push("could not determine active network interface".into());
     }
-    Ok(PreflightReport {
+    PreflightReport {
         target_disk: disk.into(),
+        install_mode,
+        staging,
+        mounted,
         handoff,
         capabilities: cap,
-        network: host_network(),
+        network,
         warnings,
-    })
+    }
+}
+
+fn validate_block_device(disk: &str) -> Result<(), EncvolError> {
+    safety::validate_disk_path(disk)?;
+    let metadata =
+        fs::metadata(disk).map_err(|_| EncvolError::UnsafeDisk("target does not exist".into()))?;
+    if !metadata.file_type().is_block_device() {
+        return Err(EncvolError::UnsafeDisk(
+            "target is not a block device".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn probe(disk: &str) -> Result<PreflightReport, EncvolError> {
+    validate_block_device(disk)?;
+    let mode_plan = self_install::plan_default_mode(disk)?;
+    if mode_plan.mode == InstallMode::BlockedMountedNonRoot {
+        let details = mode_plan
+            .mounted
+            .iter()
+            .map(|mount| format!("{} on {}", mount.source, mount.target))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(EncvolError::UnsafeDisk(format!(
+            "target disk has mounted partitions: {details}; unmount them first, for example: umount <mount-target>"
+        )));
+    }
+    Ok(base_report(
+        disk,
+        mode_plan.mode,
+        mode_plan.staging,
+        mode_plan.mounted,
+    ))
+}
+
+pub fn probe_external_descriptor(disk: &str) -> Result<PreflightReport, EncvolError> {
+    validate_block_device(disk)?;
+    if safety::is_mounted_source(disk, &mounted_sources()) {
+        return Err(EncvolError::UnsafeDisk(
+            "target disk or one of its partitions is mounted".into(),
+        ));
+    }
+    Ok(base_report(
+        disk,
+        InstallMode::ExternalEmptyOrFreeDisk,
+        None,
+        vec![],
+    ))
 }
 
 #[cfg(test)]

@@ -49,8 +49,17 @@ done
 
 # A case is an observable supported behaviour, not an arbitrary collection of
 # QEMU errors.  Keep names stable: they are used in artifact paths and JUnit.
-bios_cases=(bios-tar-root-swap bios-tarzst-root-swap-data)
-uefi_cases=(uefi-tar-root-swap uefi-tarzst-root-swap-data)
+bios_cases=(
+    bios-tar-root-swap bios-tarzst-root-swap-data
+    bios-live-root-rootdisk-free bios-live-root-secondary-free
+    bios-live-root-secondary-shrink-ext4
+    bios-live-root-mounted-target-refusal
+    bios-live-root-secondary-final-xfs-refusal
+)
+uefi_cases=(
+    uefi-tar-root-swap uefi-tarzst-root-swap-data
+    uefi-live-root-rootdisk-free uefi-live-root-secondary-free
+)
 pre_faults=(
     missing-installer-flag non-ram-root invalid-target mounted-target
     invalid-confirmation rootfs-unavailable rootfs-wrong-hash
@@ -226,9 +235,15 @@ disk_relation() {
     qemu-img compare -q -f qcow2 -F qcow2 "$overlay" "$target_base"
 }
 
+source_disk_relation() {
+    local overlay=$1
+    qemu-img compare -q -f qcow2 -F raw "$overlay" "$source_image"
+}
+
 read_case_options() {
     # A builder may provide declarative options, one key=value per line:
-    # expected_disk=changed|unchanged; serial_contains=TEXT; qemu_args_file=PATH.
+    # expected_disk=changed|unchanged; expected_source_disk=changed|unchanged;
+    # serial_contains=TEXT; qemu_args_file=PATH.
     # Only these keys are recognized, so test artifacts cannot affect shell.
     # Shell local assignments are expanded left-to-right before `case_name`
     # exists under `set -u`; assign it first so a fresh, option-less case is
@@ -236,6 +251,7 @@ read_case_options() {
     local case_name=$1
     local options="$artifacts/qemu/case-$case_name.expect" line key value
     expected_disk=
+    expected_source_disk=
     required_serial=()
     extra_qemu_args=()
     [[ -f $options ]] || return 0
@@ -246,6 +262,9 @@ read_case_options() {
         case $key in
             expected_disk)
                 case $value in changed|unchanged) expected_disk=$value ;; *) return 1 ;; esac
+                ;;
+            expected_source_disk)
+                case $value in changed|unchanged) expected_source_disk=$value ;; *) return 1 ;; esac
                 ;;
             serial_contains) required_serial+=("$value") ;;
             qemu_args_file)
@@ -263,7 +282,7 @@ run_one_case() {
     local name=$1 case_dir="$artifacts/cases/$1" start end duration status detail
     local source_overlay="$case_dir/disks/source.qcow2" target_overlay="$case_dir/disks/target.qcow2"
     local serial="$case_dir/serial/console.log" qemu_log="$case_dir/qemu/qemu.log" monitor="$case_dir/qemu/monitor.log"
-    local qemu_status=0 compare_status=0
+    local qemu_status=0 compare_status=0 source_compare_status=0 actual_source_disk=unverified
     case_bridge= case_tap= https_pid=
     local -a qemu_args append_args
 
@@ -290,6 +309,8 @@ run_one_case() {
         source-smoke) expected_disk=${expected_disk:-unchanged}; required_serial+=(encvol) ;;
         pre-*) expected_disk=${expected_disk:-unchanged}; required_serial+=("ENCVOL_FAULT:${name#pre-}") ;;
         post-*) expected_disk=${expected_disk:-changed}; required_serial+=("ENCVOL_FAULT:${name#post-}") ;;
+        *live-root*refusal) expected_disk=${expected_disk:-changed} ;;
+        *live-root*) expected_disk=${expected_disk:-changed}; required_serial+=('encvol: installer-run exited 0') ;;
         *) expected_disk=${expected_disk:-changed}; required_serial+=('encvol: installer-run exited 0') ;;
     esac
     if [[ $name == *tarzst-root-swap-data ]]; then
@@ -309,7 +330,7 @@ run_one_case() {
     # The virtio NIC is eth0 while initramfs-tools configures it; systemd may
     # subsequently rename it to enp0s2 in the mounted system.
     append_args=(
-        "root=/dev/vda rw console=ttyS0"
+        "root=/dev/vda1 rw console=ttyS0"
         "ip=192.168.231.2::192.168.231.1:255.255.255.0::eth0:off"
         "encvol.test_case=$name"
     )
@@ -366,12 +387,30 @@ run_one_case() {
             actual_disk=unavailable
         fi
     fi
+    if [[ -n $expected_source_disk ]]; then
+        if source_disk_relation "$source_overlay"; then
+            actual_source_disk=unchanged
+        else
+            source_compare_status=$?
+            if [[ $source_compare_status == 1 ]]; then
+                actual_source_disk=changed
+            else
+                printf 'source qemu-img compare failed with status %s\n' "$source_compare_status" >&2
+                actual_source_disk=unavailable
+            fi
+        fi
+        printf '%s\n' "$actual_source_disk" > "$case_dir/disks/source-virtual-state"
+    fi
     printf '%s\n' "$actual_disk" > "$case_dir/disks/target-virtual-state"
-    printf 'expected_disk=%s\nactual_disk=%s\nqemu_exit=%s\n' "$expected_disk" "$actual_disk" "$qemu_status" > "$case_dir/guest/outcome.env"
+    printf 'expected_disk=%s\nactual_disk=%s\nexpected_source_disk=%s\nactual_source_disk=%s\nqemu_exit=%s\n' \
+        "$expected_disk" "$actual_disk" "$expected_source_disk" "$actual_source_disk" "$qemu_status" > "$case_dir/guest/outcome.env"
 
     status=pass; detail=ok
     if [[ $qemu_status -ne 0 ]]; then status=fail; detail="QEMU exited with status $qemu_status"; fi
     if [[ $actual_disk != "$expected_disk" ]]; then status=fail; detail="target virtual state is $actual_disk; expected $expected_disk"; fi
+    if [[ -n $expected_source_disk && $actual_source_disk != "$expected_source_disk" ]]; then
+        status=fail; detail="source virtual state is $actual_source_disk; expected $expected_source_disk"
+    fi
     local marker
     for marker in "${required_serial[@]}"; do
         if ! grep -F -q -- "$marker" "$serial"; then
