@@ -161,7 +161,7 @@ installer_root="$source_root"
 mkdir -p "$installer_root/etc/initramfs-tools/hooks" "$installer_root/etc/initramfs-tools/scripts/local-top"
 cat > "$installer_root/etc/initramfs-tools/hooks/encvol-qemu" <<'EOF'
 #!/bin/sh
-set -eux
+set -eu
 PREREQ=''
 prereqs() { echo "$PREREQ"; }
 case "${1:-}" in prereqs) prereqs; exit 0;; esac
@@ -190,7 +190,7 @@ copy_exec_once() {
 add_optional_module() {
     manual_add_modules "$1" || true
 }
-copy_exec_once /usr/local/bin/encvol
+copy_file_once binary /usr/local/bin/encvol
 copy_exec_once /usr/bin/ip
 copy_exec_once /usr/sbin/wipefs
 copy_exec_once /usr/sbin/sgdisk
