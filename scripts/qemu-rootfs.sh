@@ -171,7 +171,7 @@ init_rootfs() {
     mount_disk rw
 
     local packages
-    packages=systemd-sysv,linux-image-amd64,openssh-server,sudo,ca-certificates,curl,vim-tiny,iproute2,dbus
+    packages=systemd-sysv,linux-image-amd64,openssh-server,sudo,ca-certificates,curl,vim-tiny,iproute2,dbus,passwd
     debootstrap --arch=amd64 --include="$packages" "$release" "$mount_dir" "$mirror"
 
     printf 'encvol-%s\n' "$release" > "$mount_dir/etc/hostname"
@@ -202,10 +202,16 @@ PasswordAuthentication no
 PermitRootLogin prohibit-password
 EOF
 
-    chroot "$mount_dir" useradd -m -s /bin/bash encvol 2>/dev/null || true
+    chroot "$mount_dir" /usr/sbin/groupadd -f encvol
+    if ! chroot "$mount_dir" /usr/bin/id -u encvol >/dev/null 2>&1; then
+        chroot "$mount_dir" /usr/sbin/useradd -m -g encvol -s /bin/bash encvol
+    fi
     mkdir -p "$mount_dir/home/encvol/.ssh" "$mount_dir/etc/sudoers.d"
     install -m 0600 "$key" "$mount_dir/home/encvol/.ssh/authorized_keys"
-    chroot "$mount_dir" chown -R encvol:encvol /home/encvol/.ssh
+    local encvol_uid encvol_gid
+    encvol_uid=$(chroot "$mount_dir" /usr/bin/id -u encvol)
+    encvol_gid=$(chroot "$mount_dir" /usr/bin/id -g encvol)
+    chown -R "$encvol_uid:$encvol_gid" "$mount_dir/home/encvol/.ssh"
     printf 'encvol ALL=(ALL) NOPASSWD:ALL\n' > "$mount_dir/etc/sudoers.d/encvol"
     chmod 0440 "$mount_dir/etc/sudoers.d/encvol"
     : > "$mount_dir/etc/machine-id"
