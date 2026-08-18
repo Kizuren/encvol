@@ -161,7 +161,7 @@ installer_root="$source_root"
 mkdir -p "$installer_root/etc/initramfs-tools/hooks" "$installer_root/etc/initramfs-tools/scripts/local-top"
 cat > "$installer_root/etc/initramfs-tools/hooks/encvol-qemu" <<'EOF'
 #!/bin/sh
-set -eu
+set -eux
 PREREQ=''
 prereqs() { echo "$PREREQ"; }
 case "${1:-}" in prereqs) prereqs; exit 0;; esac
