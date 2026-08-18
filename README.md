@@ -17,6 +17,24 @@ For the design, trust model, installer ABI, and test-harness details, see
 - One-line OpenSSH public key for restricted initramfs recovery SSH on port 2222.
 - A direct whole-disk `/dev/<disk>` target that may be erased.
 
+## Install
+
+Install the latest release from GitHub:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kizuren/encvol/main/scripts/install-release.sh | sudo sh
+```
+
+Install a specific release tag:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kizuren/encvol/main/scripts/install-release.sh | \
+  sudo env ENCVOL_VERSION=v0.1.0 sh
+```
+
+Each GitHub release publishes `encvol` and `encvol.sha256`; the installer
+downloads both and verifies the checksum before writing `/usr/local/sbin/encvol`.
+
 ## Build
 
 Debug/test builds may omit the embedded installer:
