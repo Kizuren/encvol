@@ -167,7 +167,20 @@ prereqs() { echo "$PREREQ"; }
 case "${1:-}" in prereqs) prereqs; exit 0;; esac
 . /usr/share/initramfs-tools/hook-functions
 copy_optional_file() {
-    [ ! -e "$1" ] || copy_file config "$1"
+    [ ! -e "$1" ] || copy_file_once config "$1"
+}
+copy_file_once() {
+    type=$1
+    src=$2
+    dest=${3:-$2}
+    if [ -d "${DESTDIR}${dest}" ]; then
+        dest="${dest}/${src##*/}"
+    fi
+    case "${dest}" in
+    /bin/* | /lib* | /sbin/*) dest="/usr${dest}" ;;
+    esac
+    [ ! -e "${DESTDIR}${dest}" ] || return 0
+    copy_file "$@"
 }
 copy_exec_once() {
     dest=${2:-$1}
@@ -225,13 +238,13 @@ copy_exec_once /usr/bin/touch
 copy_exec_once /usr/bin/chmod
 copy_optional_file /etc/cracklib/cracklib.conf
 copy_optional_file /etc/security/pwquality.conf
-copy_file config /etc/passwd
+copy_file_once config /etc/passwd
 copy_optional_file /var/cache/cracklib/cracklib_dict.hwm
 copy_optional_file /var/cache/cracklib/cracklib_dict.pwd
 copy_optional_file /var/cache/cracklib/cracklib_dict.pwi
 [ ! -x /usr/bin/zstd ] || copy_exec_once /usr/bin/zstd
 copy_exec_once /usr/bin/systemd-ask-password
-copy_file config /etc/ssl/certs/ca-certificates.crt
+copy_file_once config /etc/ssl/certs/ca-certificates.crt
 add_optional_module dm-mod
 add_optional_module dm-crypt
 add_optional_module xts
